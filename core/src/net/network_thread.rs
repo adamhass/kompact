@@ -20,6 +20,8 @@ use std::net::Shutdown::Both;
 use std::time::Duration;
 use fxhash::{FxHashMap, FxHasher};
 use std::hash::BuildHasherDefault;
+use crate::actors::Transport::TCP;
+use crate::serialisation::serialisation_ids::SYSTEM_PATH;
 
 /*
     Using https://github.com/tokio-rs/mio/blob/master/examples/tcp_server.rs as template.
@@ -90,7 +92,6 @@ impl NetworkThread {
             let mut stream_map: FxHashMap<SocketAddr, (TcpStream, VecDeque<Serialized>, Token, DecodeBuffer)> =
                 HashMap::<SocketAddr, (TcpStream, VecDeque<Serialized>, Token, DecodeBuffer), FxBuildHasher>::default();
             let mut token_map: FxHashMap<Token, SocketAddr> = HashMap::<Token, SocketAddr, FxBuildHasher>::default();
-
             NetworkThread {
                 //log,
                 addr: actual_addr,
@@ -161,7 +162,7 @@ impl NetworkThread {
                     if let Some(addr) = self.token_map.get(&token) {addr }
                     else {panic!("does not recognize connection token");}
                 };
-
+                println!("Network Thread with self.addr {} handling token for remote address {}", self.addr, addr);
                 if let Some((stream, out_buffer, _, in_buffer)) = self.stream_map.get_mut(&addr) {
                     if event.readiness().is_writable() {
                         //println!("sending buffer");
@@ -234,12 +235,15 @@ impl NetworkThread {
             let mut in_buffer = DecodeBuffer::new(buffer);
             self.poll.register(&stream, self.token.clone(), Ready::readable() | Ready::writable(), PollOpt::edge() | PollOpt::oneshot());
             stream.set_nodelay(true);
+            let mut send_queue = VecDeque::<Serialized>::new();
+            // Enqueue hello message:
+
             self.token_map.insert(self.token.clone(), addr.clone());
             self.stream_map.insert(
                 addr.clone(),
                 (
                     stream,
-                    VecDeque::<Serialized>::new(),
+                    send_queue,
                     self.token.clone(),
                     in_buffer,
                 )
@@ -290,10 +294,6 @@ impl NetworkThread {
         let mut sum_read_bytes = 0;
         let mut interrupts = 0;
         loop {
-            // Keep all the read bytes in the buffer without overwriting
-            if read_bytes > 0 {
-                in_buffer.advance_writeable(read_bytes);
-            }
             if let Some(mut io_vec) = in_buffer.get_writeable() {
                 match stream.read_bufs(&mut [&mut io_vec]) {
                     Ok(0) => {
@@ -322,6 +322,10 @@ impl NetworkThread {
             } else {
                 return Err(Error::new(ErrorKind::InvalidData, "No space in Buffer"));
             }
+            // Keep all the read bytes in the buffer without overwriting
+            if read_bytes > 0 {
+                in_buffer.advance_writeable(read_bytes);
+            }
         }
     }
 
@@ -337,6 +341,7 @@ impl NetworkThread {
                         use serialisation::helpers::deserialise_msg;
                         let buf = fr.payload();
                         let mut envelope = deserialise_msg(buf).expect("s11n errors");
+                        println!("Network Thread handling envelope with sender {} and receiver {}", envelope.sender, envelope.receiver);
                         match lease_lookup.get_by_actor_path(envelope.receiver()) {
                             None => {
                                 println!(

@@ -8,7 +8,12 @@ use bytes::Bytes;
 use std;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::net::SocketAddr;
 use crate::net::buffer::ChunkLease;
+use crate::serialisation::serialisation_ids::{ACTOR_PATH, SYSTEM_PATH};
+use crate::serialisation::{Deserialiser, SerError, SerId, Serialisable, Serialiser};
+use crate::actors::SystemPath;
+use crate::serialisation;
 //use stream::StreamId;
 
 pub const MAGIC_NUM: u32 = 0xC0A1BA11;
@@ -21,6 +26,8 @@ pub enum FramingError {
     UnsupportedFrameType,
     InvalidMagicNum,
     InvalidFrame,
+    SerialisationError,
+    OptionError,
     Io(std::io::Error),
 }
 
@@ -36,6 +43,7 @@ pub enum Frame {
     StreamRequest(StreamRequest),
     CreditUpdate(CreditUpdate),
     Data(Data),
+    Hello(SocketAddr),
 }
 
 impl Frame {
@@ -44,6 +52,7 @@ impl Frame {
             Frame::StreamRequest(_) => FrameType::StreamRequest,
             Frame::CreditUpdate(_) => FrameType::CreditUpdate,
             Frame::Data(_) => FrameType::Data,
+            Frame::Hello(_) => FrameType::Hello,
         }
     }
     /*
@@ -65,6 +74,7 @@ impl Frame {
             Frame::StreamRequest(ref frame) => frame.encode_into(dst),
             Frame::CreditUpdate(ref frame) => frame.encode_into(dst),
             Frame::Data(ref frame) => frame.encode_into(dst),
+            Frame::Hello(_) => FrameType::Hello,
             _ => Err(()),
         }
     }
@@ -75,6 +85,7 @@ impl Frame {
             Frame::StreamRequest(ref frame) => frame.encoded_len(),
             Frame::CreditUpdate(ref frame) => frame.encoded_len(),
             Frame::Data(ref frame) => frame.encoded_len(),
+            Frame::Hello(ref frame) => frame.encoded_len(),
             _ => 0,
         }
     }
@@ -105,6 +116,13 @@ pub struct Data {
     pub payload: ChunkLease,
 }
 
+#[derive(Debug)]
+pub struct Hello {
+    //pub stream_id: StreamId,
+    //pub seq_num: u32,
+    pub system_path: SystemPath,
+}
+
 /// Byte-mappings for frame types
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Ord, PartialOrd, Eq)]
@@ -112,7 +130,8 @@ pub enum FrameType {
     StreamRequest = 0x01,
     Data = 0x02,
     CreditUpdate = 0x03,
-    Unknown = 0x04,
+    Hello = 0x04,
+    Unknown = 0x05,
 }
 
 impl From<u8> for FrameType {
@@ -121,6 +140,7 @@ impl From<u8> for FrameType {
             0x01 => FrameType::StreamRequest,
             0x02 => FrameType::Data,
             0x03 => FrameType::CreditUpdate,
+            0x04 => FrameType::Hello,
             _ => FrameType::Unknown,
         }
     }
@@ -181,6 +201,14 @@ impl StreamRequest {
     pub fn new(credit_capacity: u32) -> Self {
         StreamRequest {
             credit_capacity,
+        }
+    }
+}
+
+impl Hello {
+    pub fn new(system_path: SystemPath) -> Self {
+        Hello {
+            system_path,
         }
     }
 }
@@ -259,6 +287,31 @@ impl FrameExt for StreamRequest {
 
     fn encoded_len(&self) -> usize {
         4 //stream_id + credit_capacity
+    }
+}
+
+impl FrameExt for Hello {
+    fn decode_from(mut src: ChunkLease) -> Result<Frame, FramingError> {
+        if src.remaining() < SYSTEM_PATH.size_hint().unwrap() {
+            return Err(FramingError::InvalidFrame);
+        }
+        if let Ok(system_path) = SystemPath::deserialise(&mut src) {
+            Ok(Frame::Hello(Hello::new(system_path)))
+        } else {
+            Err(FramingError::SerialisationError)
+        }
+    }
+
+    fn encode_into<B: BufMut>(&self, dst: &mut B) -> Result<(), ()> {
+        if let Ok(()) = Serialisable::serialise(&self.system_path, dst) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        SYSTEM_PATH.size_hint().unwrap()
     }
 }
 

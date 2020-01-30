@@ -19,8 +19,8 @@ pub mod framing;
 #[derive(Debug)]
 pub struct NetMessage {
     ser_id: SerId,
-    sender: ActorPath,
-    receiver: ActorPath,
+    pub(crate) sender: ActorPath,
+    pub(crate) receiver: ActorPath,
     data: HeapOrSer,
 }
 #[derive(Debug)]
