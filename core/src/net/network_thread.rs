@@ -1,5 +1,4 @@
 use super::*;
-use crate::net::NetworkEvent;
 use std::sync::mpsc::{channel, Receiver as Recv, Sender};
 use std::{collections::{HashMap, VecDeque, LinkedList}, net::SocketAddr, usize, vec::Vec, io::{self, Read, Write, Error, ErrorKind}, mem};
 use mio::{{Events, Poll, Ready, PollOpt, Token, Registration}, event::Event, net::{TcpListener, TcpStream}, Evented};
@@ -7,7 +6,6 @@ use crate::net::{
     frames::*,
     buffer_pool::BufferPool,
     buffer::DecodeBuffer,
-    events::*,
     ConnectionState,
 };
 use crossbeam_queue::SegQueue;
@@ -22,6 +20,10 @@ use fxhash::{FxHashMap, FxHasher};
 use std::hash::BuildHasherDefault;
 use crate::actors::Transport::TCP;
 use crate::serialisation::serialisation_ids::SYSTEM_PATH;
+use mio::tcp::Shutdown;
+use crate::messaging::{DispatchEnvelope, EventEnvelope};
+use crate::net::events::NetworkEvent;
+//use crate::net::events::NetworkEvent;
 
 /*
     Using https://github.com/tokio-rs/mio/blob/master/examples/tcp_server.rs as template.
@@ -48,12 +50,13 @@ pub struct NetworkThread {
     listener: Box<TcpListener>,
     poll: Poll,
     // Contains K,V=Remote SocketAddr, Output buffer; Token for polling; Input-buffer,
-    stream_map: FxHashMap<SocketAddr, (TcpStream, VecDeque<Serialized>, Token, DecodeBuffer)>,
+    stream_map: FxHashMap<SocketAddr, (TcpStream, VecDeque<SerializedFrame>, Token, DecodeBuffer)>,
     token_map: FxHashMap<Token, SocketAddr>,
     token: Token,
     input_queue: Box<Recv<DispatchEvent>>,
     dispatcher_registration: Registration,
     dispatcher_set_readiness: SetReadiness,
+    dispatcher_ref: DispatcherRef,
     buffer_pool: BufferPool,
     sent_bytes: u64,
     received_bytes: u64,
@@ -73,6 +76,7 @@ impl NetworkThread {
         dispatcher_set_readiness: SetReadiness,
         input_queue: Recv<DispatchEvent>,
         network_thread_sender: Sender<bool>,
+        dispatcher_ref: DispatcherRef,
     ) -> NetworkThread {
         // Set-up the Listener
         if let Ok(listener) = TcpListener::bind(&addr) {
@@ -89,8 +93,8 @@ impl NetworkThread {
             // Connections and buffers
             // There's probably a better way to handle the token/addr maps
             pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
-            let mut stream_map: FxHashMap<SocketAddr, (TcpStream, VecDeque<Serialized>, Token, DecodeBuffer)> =
-                HashMap::<SocketAddr, (TcpStream, VecDeque<Serialized>, Token, DecodeBuffer), FxBuildHasher>::default();
+            let mut stream_map: FxHashMap<SocketAddr, (TcpStream, VecDeque<SerializedFrame>, Token, DecodeBuffer)> =
+                HashMap::<SocketAddr, (TcpStream, VecDeque<SerializedFrame>, Token, DecodeBuffer), FxBuildHasher>::default();
             let mut token_map: FxHashMap<Token, SocketAddr> = HashMap::<Token, SocketAddr, FxBuildHasher>::default();
             NetworkThread {
                 //log,
@@ -112,6 +116,7 @@ impl NetworkThread {
                 received_msgs: 0,
                 stopped: false,
                 network_thread_sender,
+                dispatcher_ref,
             }
         } else {
             panic!("NetworkThread failed to bind to address!");
@@ -122,12 +127,69 @@ impl NetworkThread {
     // Event loop
     pub fn run(&mut self) -> () {
         let mut events = Events::with_capacity(MAX_POLL_EVENTS);
+        println!("Network thread starting loop");
         loop {
             self.poll.poll(&mut events, None)
                 .expect("Error when calling Poll");
 
             for event in events.iter() {
-                self.handle_event(event);
+                println!("Handling event");
+                if let Some(hello_addr) = self.handle_event(event) {
+                    println!("NetworkThread {} got hello from {}", self.addr, &hello_addr);
+                    // Listening on the event returned a Hello msg with addr
+                    if let Some(registered_addr) = self.token_map.remove(&event.token()) {
+                        if hello_addr == registered_addr {
+                            // Expected case, we can carry on...
+                            self.token_map.insert(event.token(), hello_addr);
+                        } else {
+                            // Merge the connections into one
+                            println!("Merging two connections");
+                            if let Some((mut old_stream,
+                                            mut old_output_buffer,
+                                            old_token,
+                                            mut old_decode_buffer)) = self.stream_map.remove(&registered_addr) {
+                                if let Some((mut stream,
+                                                mut output_buffer,
+                                                token,
+                                                mut decode_buffer)) = self.stream_map.remove(&hello_addr) {
+                                    // Got full info of both streams
+                                    if (old_output_buffer.len() > 0 && output_buffer.len() > 0) || (old_decode_buffer.len() > 0 && decode_buffer.len() > 0) {
+                                        // We've broken fifo ordering, this is unacceptable
+                                        panic!("FIFO NOT GUARANTEED WHEN MERGING STREAMS!!");
+                                    }
+                                    if old_output_buffer.len() > 0 {
+                                        output_buffer.append(&mut old_output_buffer);
+                                        println!("Appended old_output_buffer {} to new {}", old_output_buffer.len(), output_buffer.len());
+                                    }
+                                    self.poll.register(&stream, token.clone(), Ready::readable() | Ready::writable(), PollOpt::edge() | PollOpt::oneshot());
+                                    if old_decode_buffer.len() > 0 {
+                                        println!("Keep old_decodebuffer len: {} content: {:?}", old_decode_buffer.len(), old_decode_buffer.get_buffer_head());
+                                        // Re-insert the connection with old decode
+                                        self.stream_map.insert(hello_addr, (stream, output_buffer, token, old_decode_buffer));
+                                    } else {
+                                        // Re-insert the connection with the new decode
+                                        println!("Use new decodebuffer len: {} content: {:?}", decode_buffer.len(), decode_buffer.get_buffer_head());
+                                        self.stream_map.insert(hello_addr, (stream, output_buffer, token, decode_buffer));
+                                    }
+                                    self.poll.deregister(&old_stream);
+                                    old_stream.shutdown(Shutdown::Both);
+                                } else {
+                                    // We only have the old stream set-up, re-insert it with the proper handle:
+                                    self.poll.register(&old_stream, old_token.clone(), Ready::readable() | Ready::writable(), PollOpt::edge() | PollOpt::oneshot());
+                                    self.stream_map.insert(hello_addr.clone(), (old_stream, old_output_buffer, old_token.clone(), old_decode_buffer));
+                                    self.token_map.remove(&old_token);
+                                    self.token_map.insert(old_token, hello_addr);
+                                }
+                            }
+                        }
+                        self.dispatcher_ref.tell(
+                            DispatchEnvelope::Event(
+                                EventEnvelope::Network(
+                                    NetworkEvent::Connection(hello_addr, ConnectionState::Connected(hello_addr)))));
+                    } else {
+                        panic!("No address registered for a token which yielded a hello msg");
+                    }
+                }
                 if self.stopped {
                     self.network_thread_sender.send(true);
                     return
@@ -136,7 +198,7 @@ impl NetworkThread {
         }
     }
 
-    fn handle_event(&mut self, event: Event) -> () {
+    fn handle_event(&mut self, event: Event) -> Option<SocketAddr> {
         let mut retry = false;
         match event.token() {
             SERVER => {
@@ -191,11 +253,15 @@ impl NetworkThread {
                                 //println!("read {} bytes", n);
                                 self.received_bytes += n as u64;
                                 self.poll.register(stream, token.clone(), Ready::readable(), PollOpt::edge() | PollOpt::oneshot());
-                                self.received_msgs = self.received_msgs + Self::decode(in_buffer, &mut self.lookup);
+                                if let Some(addr) = Self::decode(in_buffer, &mut self.lookup) {
+                                    return Some(addr)
+                                }
                             }
                             Err(ref err) if no_buffer_space(err) => {
                                 // Buffer full, we swap it and register for poll again
-                                self.received_msgs = self.received_msgs + Self::decode(in_buffer, &mut self.lookup);
+                                if let Some(addr) = Self::decode(in_buffer, &mut self.lookup) {
+                                    return Some(addr)
+                                }
                                 if let Some(mut new_buffer) = self.buffer_pool.get_buffer() {
                                     in_buffer.swap_buffer(&mut new_buffer);
                                     self.buffer_pool.return_buffer(new_buffer);
@@ -215,6 +281,7 @@ impl NetworkThread {
                 }
             }
         }
+        None
     }
 
     fn request_stream(&mut self, addr: SocketAddr) -> io::Result<bool> {
@@ -235,9 +302,18 @@ impl NetworkThread {
             let mut in_buffer = DecodeBuffer::new(buffer);
             self.poll.register(&stream, self.token.clone(), Ready::readable() | Ready::writable(), PollOpt::edge() | PollOpt::oneshot());
             stream.set_nodelay(true);
-            let mut send_queue = VecDeque::<Serialized>::new();
+            let mut send_queue = VecDeque::<SerializedFrame>::new();
             // Enqueue hello message:
-
+            println!("Encoding hello");
+            let hello = Frame::Hello(Hello::new(self.addr));
+            let mut hello_bytes = BytesMut::with_capacity(hello.encoded_len());
+            //hello_bytes.extend_from_slice(&[0;hello.encoded_len()]);
+            if let Ok(()) = hello.encode_into(&mut hello_bytes) {
+                println!("Encoded hello: {:?}", hello_bytes);
+                send_queue.push_back(SerializedFrame::Bytes(hello_bytes.freeze()));
+            } else {
+                panic!("Unable to send hello bytes, failed to encode!");
+            }
             self.token_map.insert(self.token.clone(), addr.clone());
             self.stream_map.insert(
                 addr.clone(),
@@ -268,17 +344,14 @@ impl NetworkThread {
                         self.poll.register(stream, token.clone(), Ready::writable(), PollOpt::edge() | PollOpt::oneshot());
                     } else {
                         // The stream isn't set-up, request connection, set-it up and try to send the message
-                        self.request_stream(addr.clone());
-                        if let Some((stream, buffer, _, _)) = self.stream_map.get_mut(&addr) {
-                            buffer.push_back(packet);
-                            Self::send_buffer(stream, buffer);
-                        } else {
-                            //println!("network thread {} failed to set-up stream to {}", &self.addr, addr);
-                        }
+
                     }
                 },
                 DispatchEvent::Stop() => {
                     self.stop();
+                },
+                DispatchEvent::Connect(addr) => {
+                    self.request_stream(addr.clone());
                 },
             }
         }
@@ -293,6 +366,7 @@ impl NetworkThread {
         let mut read_bytes = 0;
         let mut sum_read_bytes = 0;
         let mut interrupts = 0;
+        println!("Network thread receiving on local stream {} from remote {}", stream.local_addr().unwrap(), stream.peer_addr().unwrap());
         loop {
             if let Some(mut io_vec) = in_buffer.get_writeable() {
                 match stream.read_bufs(&mut [&mut io_vec]) {
@@ -329,8 +403,7 @@ impl NetworkThread {
         }
     }
 
-    fn decode(in_buffer: &mut DecodeBuffer, lookup: &mut Arc<ArcSwap<ActorStore>>) -> u64 {
-        let mut msgs = 0;
+    fn decode(in_buffer: &mut DecodeBuffer, lookup: &mut Arc<ArcSwap<ActorStore>>) -> Option<SocketAddr> {
         while let Some(mut frame) = in_buffer.get_frame() {
             match frame {
                 Frame::Data(fr) => {
@@ -349,18 +422,21 @@ impl NetworkThread {
                                     envelope.receiver());
                             }
                             Some(actor) => {
-                                msgs = msgs +1;
                                 actor.enqueue(envelope);
                             }
                         }
                     }
                 },
+                Frame::Hello(hello) => {
+                    println!("Got hello message!");
+                    return Some(hello.addr());
+                }
                 _ => {
                     println!("Unexpected frame type");
                 },
             }
         };
-        return msgs;
+        None
     }
 
     fn stop(&mut self) -> () {
@@ -378,7 +454,7 @@ impl NetworkThread {
         self.token = Token(next);
     }
 
-    fn send_buffer(stream: &mut TcpStream, buffer: &mut VecDeque<Serialized>) -> io::Result<usize> {
+    fn send_buffer(stream: &mut TcpStream, buffer: &mut VecDeque<SerializedFrame>) -> io::Result<usize> {
         let mut sent_bytes = 0;
         let mut interrupts = 0;
         while let Some(mut buf) = buffer.pop_front() {
@@ -387,13 +463,13 @@ impl NetworkThread {
                     sent_bytes = sent_bytes + n;
                     match &mut buf {
                         // Split the data and continue sending the rest later
-                        Serialized::Bytes(bytes) => {
+                        SerializedFrame::Bytes(bytes) => {
                             if n < bytes.len() {
                                 bytes.split_to(n);
                                 buffer.push_front(buf);
                             }
                         }
-                        Serialized::Chunk(chunk) => {
+                        SerializedFrame::Chunk(chunk) => {
                             if n < chunk.bytes().len() {
                                 chunk.advance(n);
                                 buffer.push_front(buf);
@@ -426,13 +502,13 @@ impl NetworkThread {
         return Ok(sent_bytes);
     }
 
-    fn write_serialized(stream: &mut TcpStream, serialized: &mut Serialized) -> io::Result<usize> {
+    fn write_serialized(stream: &mut TcpStream, serialized: &mut SerializedFrame) -> io::Result<usize> {
         match serialized {
-            Serialized::Chunk(chunk) => {
+            SerializedFrame::Chunk(chunk) => {
                 //println!("writing chunk");
                 stream.write(chunk.bytes())
             }
-            Serialized::Bytes(bytes) => {
+            SerializedFrame::Bytes(bytes) => {
                 //println!("writing bytes");
                 stream.write(bytes.bytes())
             }

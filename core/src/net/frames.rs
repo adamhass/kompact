@@ -8,7 +8,7 @@ use bytes::Bytes;
 use std;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr, IpAddr, Ipv6Addr};
 use crate::net::buffer::ChunkLease;
 use crate::serialisation::serialisation_ids::{ACTOR_PATH, SYSTEM_PATH};
 use crate::serialisation::{Deserialiser, SerError, SerId, Serialisable, Serialiser};
@@ -43,7 +43,7 @@ pub enum Frame {
     StreamRequest(StreamRequest),
     CreditUpdate(CreditUpdate),
     Data(Data),
-    Hello(SocketAddr),
+    Hello(Hello),
 }
 
 impl Frame {
@@ -74,7 +74,7 @@ impl Frame {
             Frame::StreamRequest(ref frame) => frame.encode_into(dst),
             Frame::CreditUpdate(ref frame) => frame.encode_into(dst),
             Frame::Data(ref frame) => frame.encode_into(dst),
-            Frame::Hello(_) => FrameType::Hello,
+            Frame::Hello(ref frame) => frame.encode_into(dst),
             _ => Err(()),
         }
     }
@@ -111,8 +111,6 @@ pub struct CreditUpdate {
 
 #[derive(Debug)]
 pub struct Data {
-    //pub stream_id: StreamId,
-    //pub seq_num: u32,
     pub payload: ChunkLease,
 }
 
@@ -120,7 +118,7 @@ pub struct Data {
 pub struct Hello {
     //pub stream_id: StreamId,
     //pub seq_num: u32,
-    pub system_path: SystemPath,
+    pub addr: SocketAddr,
 }
 
 /// Byte-mappings for frame types
@@ -206,10 +204,13 @@ impl StreamRequest {
 }
 
 impl Hello {
-    pub fn new(system_path: SystemPath) -> Self {
+    pub fn new(addr: SocketAddr) -> Self {
         Hello {
-            system_path,
+            addr,
         }
+    }
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
     }
 }
 
@@ -292,26 +293,51 @@ impl FrameExt for StreamRequest {
 
 impl FrameExt for Hello {
     fn decode_from(mut src: ChunkLease) -> Result<Frame, FramingError> {
-        if src.remaining() < SYSTEM_PATH.size_hint().unwrap() {
-            return Err(FramingError::InvalidFrame);
-        }
-        if let Ok(system_path) = SystemPath::deserialise(&mut src) {
-            Ok(Frame::Hello(Hello::new(system_path)))
-        } else {
-            Err(FramingError::SerialisationError)
+        match src.get_u8() {
+            4 => {
+                let ip = Ipv4Addr::from(src.get_u32());
+                let port = src.get_u16();
+                let addr = SocketAddr::new(IpAddr::V4(ip), port);
+                Ok(Frame::Hello(Hello::new(addr)))
+            }
+            6 => {
+                let ip = Ipv6Addr::from(src.get_u128());
+                let port = src.get_u16();
+                let addr = SocketAddr::new(IpAddr::V6(ip), port);
+                Ok(Frame::Hello(Hello::new(addr)))
+            }
+            _ => {
+                panic!("Faulty Hello Message!");
+            }
         }
     }
 
     fn encode_into<B: BufMut>(&self, dst: &mut B) -> Result<(), ()> {
-        if let Ok(()) = Serialisable::serialise(&self.system_path, dst) {
-            Ok(())
-        } else {
-            Err(())
+        match self.addr {
+            SocketAddr::V4(v4) => {
+                dst.put_u8(4); // version
+                dst.put_slice(&v4.ip().octets()); // ip
+                dst.put_u16(v4.port()); // port
+                Ok(())
+            }
+            SocketAddr::V6(v6) => {
+                dst.put_u8(6); // version
+                dst.put_slice(&v6.ip().octets()); // ip
+                dst.put_u16(v6.port()); // port
+                Ok(())
+            }
         }
     }
 
     fn encoded_len(&self) -> usize {
-        SYSTEM_PATH.size_hint().unwrap()
+        match self.addr {
+            SocketAddr::V4(v4) => {
+                1 + 4 + 2 // version + ip + port
+            }
+            SocketAddr::V6(v6) => {
+                1 + 16 + 2 // version + ip + port
+            }
+        }
     }
 }
 

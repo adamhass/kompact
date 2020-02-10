@@ -172,6 +172,8 @@ impl DecodeBuffer{
         }
     }
 
+    pub fn len(&self) -> usize { self.write_offset - self.read_offset }
+
     pub fn remaining(&self) -> usize {
         self.buffer.len() - self.write_offset
     }
@@ -234,6 +236,15 @@ impl DecodeBuffer{
                             if let Ok(data) = StreamRequest::decode_from(lease) {
                                 self.next_frame_head = None;
                                 return Some(data);
+                            }
+                        },
+                        FrameType::Hello => {
+                            println!("decoding Hello");
+                            if let Ok(hello) = Hello::decode_from(lease) {
+                                self.next_frame_head = None;
+                                return Some(hello);
+                            } else {
+                                println!("Failed to decode data");
                             }
                         },
                         _ => {
