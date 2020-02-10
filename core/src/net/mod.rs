@@ -30,6 +30,7 @@ pub mod network_thread;
 pub mod frames;
 pub mod buffer_pool;
 pub mod buffer;
+pub mod network_channel;
 
 #[derive(Debug)]
 pub enum ConnectionState {
