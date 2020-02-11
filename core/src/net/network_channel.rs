@@ -2,19 +2,21 @@ use std::collections::VecDeque;
 use mio::tcp::TcpStream;
 use mio::{Token};
 use std::net::SocketAddr;
-use crate::messaging::Serialized;
+use crate::messaging::{SerializedFrame};
 use crate::net::buffer::{DecodeBuffer, BufferChunk};
 use crate::net::{ConnectionState, network_thread};
-use crate::net::frames::Frame;
+use crate::net::frames::{Frame, Hello};
 use crate::net::network_thread::*;
 use std::io;
 use std::io::{Write, ErrorKind, Error};
-use bytes::Buf;
+use bytes::{Buf, BytesMut};
 use std::net::Shutdown::Both;
+use core::mem;
+use std::cmp::Ordering;
 
 pub struct TcpChannel {
     stream: TcpStream,
-    outbound_queue: VecDeque<Serialized>,
+    outbound_queue: VecDeque<SerializedFrame>,
     pub token: Token,
     input_buffer: DecodeBuffer,
     pub state: ConnectionState,
@@ -33,11 +35,29 @@ impl TcpChannel {
         }
     }
 
-    pub fn stream(&self) -> &TcpStream {
-        &self.stream
+    pub fn stream_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
     }
 
-    pub fn initialize(&mut self, addr: SocketAddr) -> () {
+    pub fn stream(&self) -> & TcpStream {
+        & self.stream
+    }
+
+    pub fn has_remaining_output(&self) -> bool {
+        if self.outbound_queue.len() > 0 {true}
+        else {false}
+    }
+
+    pub fn initialize(&mut self, addr: &SocketAddr) -> () {
+        let hello = Frame::Hello(Hello::new(*addr));
+        let mut hello_bytes = BytesMut::with_capacity(hello.encoded_len());
+        //hello_bytes.extend_from_slice(&[0;hello.encoded_len()]);
+        if let Ok(()) = hello.encode_into(&mut hello_bytes) {
+            self.outbound_queue.push_back(SerializedFrame::Bytes(hello_bytes.freeze()));
+            self.try_drain();
+        } else {
+            panic!("Unable to send hello bytes, failed to encode!");
+        }
 
     }
 
@@ -87,13 +107,14 @@ impl TcpChannel {
 
     pub fn shutdown(&mut self) -> () {
         self.stream.shutdown(Both);
+        self.state = ConnectionState::Closed;
     }
 
     pub fn decode(&mut self) -> Option<Frame> {
         self.input_buffer.get_frame()
     }
 
-    pub fn enqueue_serialized(&mut self, serialized: Serialized) -> io::Result<usize> {
+    pub fn enqueue_serialized(&mut self, serialized: SerializedFrame) -> io::Result<usize> {
         self.outbound_queue.push_back(serialized);
         self.try_drain()
     }
@@ -107,13 +128,13 @@ impl TcpChannel {
                     sent_bytes = sent_bytes + n;
                     match &mut serialized_frame {
                         // Split the data and continue sending the rest later if we sent less than the full frame
-                        Serialized::Bytes(bytes) => {
+                        SerializedFrame::Bytes(bytes) => {
                             if n < bytes.len() {
                                 bytes.split_to(n);
                                 self.outbound_queue.push_front(serialized_frame);
                             }
                         }
-                        Serialized::Chunk(chunk) => {
+                        SerializedFrame::Chunk(chunk) => {
                             if n < chunk.bytes().len() {
                                 chunk.advance(n);
                                 self.outbound_queue.push_front(serialized_frame);
@@ -146,13 +167,76 @@ impl TcpChannel {
         Ok(sent_bytes)
     }
 
-    pub fn write_serialized(&mut self, serialized: &Serialized) -> io::Result<usize> {
+    pub fn write_serialized(&mut self, serialized: &SerializedFrame) -> io::Result<usize> {
         match serialized {
-            Serialized::Chunk(chunk) => {
+            SerializedFrame::Chunk(chunk) => {
                 self.stream.write(chunk.bytes())
             }
-            Serialized::Bytes(bytes) => {
+            SerializedFrame::Bytes(bytes) => {
                 self.stream.write(bytes.bytes())
+            }
+        }
+    }
+
+    /// Compares the SocketAddr the two channels are bound on and ensures that both sides will merge into the same channel on both sides
+    /// The channel to retain will be self while the unused other will be stopped.
+    pub fn merge(&mut self, other: &mut TcpChannel) -> () {
+        let this_peer = SocketWrapper{ inner: self.stream.peer_addr().unwrap()};
+        let that_peer = SocketWrapper{ inner: other.stream.peer_addr().unwrap()};
+        let this_local = SocketWrapper{ inner: self.stream.local_addr().unwrap()};
+        let that_local =  SocketWrapper{ inner: other.stream.local_addr().unwrap()};
+
+        if (this_peer < that_peer && this_peer < this_local && this_peer < that_local) ||
+            (this_local < that_local && this_local < this_peer && this_local < that_local) {
+            // Keep self, this_local or this_peer was the lowest in the set
+        } else {
+            // Keep other
+            mem::swap(other.stream_mut(), self.stream_mut());
+        }
+        other.shutdown();
+        if other.outbound_queue.len() > 0 {
+            self.outbound_queue.append(&mut other.outbound_queue);
+        }
+    }
+
+    fn merge_with(&mut self, other: &mut Self) -> () {
+
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct SocketWrapper {
+    pub inner: SocketAddr
+}
+
+impl std::cmp::PartialOrd for SocketWrapper{
+    fn partial_cmp(&self, other: &SocketWrapper) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SocketWrapper {
+    fn cmp(&self, other: &SocketWrapper) -> Ordering {
+        match self.inner {
+            SocketAddr::V4(self_v4) => {
+                if other.inner.is_ipv6() { Ordering::Greater}
+                else {
+                    if self.inner.ip() == other.inner.ip() {
+                        self.inner.port().cmp(&other.inner.port())
+                    } else {
+                        self.inner.ip().cmp(&other.inner.ip())
+                    }
+                }
+            },
+            SocketAddr::V6(self_v6) => {
+                if other.inner.is_ipv4() { Ordering::Greater}
+                else {
+                    if self.inner.ip() == other.inner.ip() {
+                        self.inner.port().cmp(&other.inner.port())
+                    } else {
+                        self.inner.ip().cmp(&other.inner.ip())
+                    }
+                }
             }
         }
     }
