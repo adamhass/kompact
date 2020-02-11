@@ -212,6 +212,7 @@ impl Bridge {
         */
         // Wait for network thread to receive the "stopped" event
         self.network_thread_receiver.recv(); // should block until something is sent
+        //println!("bridge stopped!");
         debug!(self.log, "Stopped NetworkBridge.");
         Ok(())
     }

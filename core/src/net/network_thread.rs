@@ -174,6 +174,7 @@ impl NetworkThread {
                 }
                 if self.stopped {
                     self.network_thread_sender.send(true);
+                    //println!("{} Stopped!", self.addr);
                     return
                 };
             }
@@ -202,92 +203,120 @@ impl NetworkThread {
             token => {
                 // lookup token state in kv map <token, state> (it's corresponding addr for now)
                 let addr = {
-                    if let Some(addr) = self.token_map.get(&token) {addr }
+                    if let Some(addr) = self.token_map.get(&token) {addr.clone() }
                     else {panic!("does not recognize connection token");}
                 };
+                if event.readiness().is_writable() {
+                    self.try_write(&addr);
+                }
+                if event.readiness().is_readable() {
+                    return self.try_read(&addr);
+                }
+            }
+        }
+        None
+    }
 
-                if let Some(channel) = self.channel_map.get_mut(&addr) {
-                    if event.readiness().is_writable() {
-                        match channel.try_drain() {
-                            Err(ref err) if broken_pipe(err) => {
-                                println!("BROKEN PIPE WRITE");
-                            }
-                            Ok(n) => {
-                                self.sent_bytes = self.sent_bytes + n as u64;
-                                if channel.has_remaining_output() {
-                                    self.poll.register(channel.stream(), token.clone(), Ready::writable(), PollOpt::edge() | PollOpt::oneshot());
+    fn try_write(&mut self, addr: &SocketAddr) -> () {
+        if let Some(channel) = self.channel_map.get_mut(&addr) {
+            match channel.try_drain() {
+                Err(ref err) if broken_pipe(err) => {
+                    println!("BROKEN PIPE WRITE");
+                }
+                Ok(n) => {
+                    self.sent_bytes = self.sent_bytes + n as u64;
+                    if channel.has_remaining_output() {
+                        self.poll.register(channel.stream(), channel.token.clone(), Ready::writable(), PollOpt::edge() | PollOpt::oneshot());
+                    }
+                }
+                Err(e) => {
+                    println!("Error while sending! {:?}", e);
+                }
+            }
+        }
+    }
+
+    fn try_read(&mut self, addr: &SocketAddr) -> Option<SocketAddr> {
+        //println!("{} channel.receive()", self.addr);
+        if let Some(channel) = self.channel_map.get_mut(&addr) {
+            match channel.receive() {
+                Ok(0) => {
+                    // Eof?
+                }
+                Ok(n) => {
+                    //println!("read {} bytes", n);
+                    self.received_bytes += n as u64;
+                    self.poll.register(channel.stream(), channel.token.clone(), Ready::readable(), PollOpt::edge() | PollOpt::oneshot());
+                }
+                Err(ref err) if no_buffer_space(err) => {
+                    //println!("no buffer space");
+                    // Buffer full, we swap it and register for poll again
+                    if let Some(mut new_buffer) = self.buffer_pool.get_buffer() {
+                        channel.swap_buffer(&mut new_buffer);
+                        self.buffer_pool.return_buffer(new_buffer);
+                    }
+                    //println!("buffers swapped, try_read again");
+                    // Handle this event again without continuing the current method invocation
+                    //return self.try_read(addr);
+                    self.poll.register(channel.stream(), channel.token.clone(), Ready::readable(), PollOpt::edge() | PollOpt::oneshot());
+                }
+                Err(err) if interrupted(&err) || would_block(&err) => {
+                    // Just retry later
+                    self.poll.register(channel.stream(), channel.token.clone(), Ready::readable(), PollOpt::edge() | PollOpt::oneshot());
+                }
+                Err(err) if connection_reset(&err) => {
+                    channel.shutdown();
+                    self.dispatcher_ref.tell(
+                        DispatchEnvelope::Event(
+                            EventEnvelope::Network(
+                                NetworkEvent::Connection(*addr, ConnectionState::Closed))));
+                }
+                Err(err) => {
+                    // Fatal error don't try to read again
+                    println!("network thread {} Error while reading, received msgs: {}\n {:?}", self.addr, self.received_msgs, err);
+                }
+            }
+            let mut msgs = 0;
+            //println!("{} channel.decode()", self.addr);
+            while let Some(frame) = channel.decode() {
+                self.received_msgs = msgs;
+                match frame {
+                    Frame::Data(fr) => {
+                        // Forward the data frame to the correct actor
+                        //println!("{} data frame...", self.addr);
+                        let lease_lookup = self.lookup.lease();
+                        {
+                            use dispatch::lookup::ActorLookup;
+                            use serialisation::helpers::deserialise_msg;
+                            let buf = fr.payload();
+                            let mut envelope = deserialise_msg(buf).expect("s11n errors");
+                            match lease_lookup.get_by_actor_path(envelope.receiver()) {
+                                None => {
+                                    println!(
+                                        "Could not find actor reference for destination: {:?}",
+                                        envelope.receiver());
+                                }
+                                Some(actor) => {
+                                    msgs = msgs + 1;
+                                    actor.enqueue(envelope);
                                 }
                             }
-                            Err(e) => {
-                                println!("Error while sending! {:?}", e);
-                            }
                         }
+                    },
+                    Frame::Hello(hello) => {
+                        //println!("Got hello message!");
+                        return Some(hello.addr());
+                    },
+                    Frame::Bye() => {
+                        channel.shutdown();
+                        self.dispatcher_ref.tell(
+                            DispatchEnvelope::Event(
+                                EventEnvelope::Network(
+                                    NetworkEvent::Connection(*addr, ConnectionState::Closed))));
                     }
-                    if event.readiness().is_readable() {
-                        //println!("{} channel.receive()", self.addr);
-                        match channel.receive() {
-                            Ok(0) => {
-                                // Eof?
-                            }
-                            Ok(n) => {
-                                //println!("read {} bytes", n);
-                                self.received_bytes += n as u64;
-                                self.poll.register(channel.stream(), token.clone(), Ready::readable(), PollOpt::edge() | PollOpt::oneshot());
-                            }
-                            Err(ref err) if no_buffer_space(err) => {
-                                // Buffer full, we swap it and register for poll again
-                                if let Some(mut new_buffer) = self.buffer_pool.get_buffer() {
-                                    channel.swap_buffer(&mut new_buffer);
-                                    self.buffer_pool.return_buffer(new_buffer);
-                                }
-                                // Handle this event again without continuing the current method invocation
-                                return self.handle_event(event);
-                            }
-                            Err(err) if interrupted(&err) || would_block(&err) => {
-                                // Just retry later
-                                self.poll.register(channel.stream(), token.clone(), Ready::readable(), PollOpt::edge() | PollOpt::oneshot());
-                            }
-                            Err(err) => {
-                                // Fatal error don't try to read again
-                                println!("network thread {} Error while reading, received msgs: {}\n {:?}", self.addr, self.received_msgs, err);
-                            }
-                        }
-                        let mut msgs = 0;
-                        //println!("{} channel.decode()", self.addr);
-                        while let Some(frame) = channel.decode() {
-                            self.received_msgs = msgs;
-                            match frame {
-                                Frame::Data(fr) => {
-                                    // Forward the data frame to the correct actor
-                                    let lease_lookup = self.lookup.lease();
-                                    {
-                                        use dispatch::lookup::ActorLookup;
-                                        use serialisation::helpers::deserialise_msg;
-                                        let buf = fr.payload();
-                                        let mut envelope = deserialise_msg(buf).expect("s11n errors");
-                                        match lease_lookup.get_by_actor_path(envelope.receiver()) {
-                                            None => {
-                                                println!(
-                                                    "Could not find actor reference for destination: {:?}",
-                                                    envelope.receiver());
-                                            }
-                                            Some(actor) => {
-                                                msgs = msgs +1;
-                                                actor.enqueue(envelope);
-                                            }
-                                        }
-                                    }
-                                },
-                                Frame::Hello(hello) => {
-                                    //println!("Got hello message!");
-                                    return Some(hello.addr());
-                                },
-                                _ => {
-                                    println!("Unexpected frame type");
-                                },
-                            }
-                        }
-                    }
+                    _ => {
+                        println!("Unexpected frame type");
+                    },
                 }
             }
         }
@@ -366,8 +395,19 @@ impl NetworkThread {
 
     fn stop(&mut self) -> () {
         //println!("{} Stopping", self.addr);
+        let tokens = self.token_map.clone();
+        for (_, addr) in tokens {
+            self.try_read(&addr);
+        }
         for (_, mut channel) in self.channel_map.drain() {
-            channel.shutdown();
+            match channel.state {
+                ConnectionState::Closed => {
+
+                },
+                _ => {
+                    channel.graceful_shutdown();
+                }
+            }
         }
         self.stopped = true;
     }
@@ -389,6 +429,10 @@ pub fn interrupted(err: &io::Error) -> bool {
 
 pub fn no_buffer_space(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::InvalidData
+}
+
+pub fn connection_reset(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::ConnectionReset
 }
 
 pub fn broken_pipe(err: &io::Error) -> bool {

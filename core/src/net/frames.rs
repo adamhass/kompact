@@ -44,6 +44,7 @@ pub enum Frame {
     CreditUpdate(CreditUpdate),
     Data(Data),
     Hello(Hello),
+    Bye(),
 }
 
 impl Frame {
@@ -53,6 +54,7 @@ impl Frame {
             Frame::CreditUpdate(_) => FrameType::CreditUpdate,
             Frame::Data(_) => FrameType::Data,
             Frame::Hello(_) => FrameType::Hello,
+            Frame::Bye() => FrameType::Bye,
         }
     }
     /*
@@ -75,6 +77,7 @@ impl Frame {
             Frame::CreditUpdate(ref frame) => frame.encode_into(dst),
             Frame::Data(ref frame) => frame.encode_into(dst),
             Frame::Hello(ref frame) => frame.encode_into(dst),
+            Frame::Bye() => Ok(()),
             _ => Err(()),
         }
     }
@@ -129,7 +132,8 @@ pub enum FrameType {
     Data = 0x02,
     CreditUpdate = 0x03,
     Hello = 0x04,
-    Unknown = 0x05,
+    Bye = 0x05,
+    Unknown = 0x06,
 }
 
 impl From<u8> for FrameType {
@@ -139,6 +143,7 @@ impl From<u8> for FrameType {
             0x02 => FrameType::Data,
             0x03 => FrameType::CreditUpdate,
             0x04 => FrameType::Hello,
+            0x05 => FrameType::Bye,
             _ => FrameType::Unknown,
         }
     }

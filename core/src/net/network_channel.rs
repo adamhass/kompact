@@ -95,7 +95,7 @@ impl TcpChannel {
                         }
                     },
                     Err(err) => {
-                        println!("network thread {} got uncaught error during read from remote {}", self.stream.local_addr().unwrap(), self.stream.peer_addr().unwrap());
+                        //println!("network thread {} got uncaught error during read from remote {}", self.stream.local_addr().unwrap(), self.stream.peer_addr().unwrap());
                         return Err(err)
                     }
                 }
@@ -104,8 +104,35 @@ impl TcpChannel {
             }
         }
     }
+/*
+    pub fn close(&mut self) -> () {
+        let bye = Frame::Bye();
+        let mut bye_bytes = BytesMut::with_capacity(hello.encoded_len());
+        //hello_bytes.extend_from_slice(&[0;hello.encoded_len()]);
+        if let Ok(()) = bye.encode_into(&mut bye_bytes) {
+            self.outbound_queue.push_back(SerializedFrame::Bytes(bye_bytes.freeze()));
+            self.try_drain();
+        } else {
+            panic!("Unable to send hello bytes, failed to encode!");
+        }
+
+    }*/
+
+    pub fn graceful_shutdown(&mut self) -> () {
+        let bye = Frame::Bye();
+        let mut bye_bytes = BytesMut::with_capacity(bye.encoded_len());
+        //hello_bytes.extend_from_slice(&[0;hello.encoded_len()]);
+        if let Ok(()) = bye.encode_into(&mut bye_bytes) {
+            self.outbound_queue.push_back(SerializedFrame::Bytes(bye_bytes.freeze()));
+            self.try_drain();
+        } else {
+            panic!("Unable to send hello bytes, failed to encode!");
+        }
+        self.shutdown();
+    }
 
     pub fn shutdown(&mut self) -> () {
+        //self.receive();
         self.stream.shutdown(Both);
         self.state = ConnectionState::Closed;
     }
