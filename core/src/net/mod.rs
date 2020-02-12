@@ -148,6 +148,7 @@ impl Bridge {
         let (sender, receiver ) = channel();
         let (network_thread_sender, network_thread_receiver ) = channel();
         let mut network_thread = NetworkThread::new(
+            network_thread_log,
             addr,
             lookup.clone(),
             registration,

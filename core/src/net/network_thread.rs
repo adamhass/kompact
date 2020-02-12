@@ -40,7 +40,7 @@ const MAX_POLL_EVENTS: usize = 1024;
 pub const MAX_INTERRUPTS: i32 = 9;
 
 pub struct NetworkThread {
-    //log: KompactLogger,
+    log: KompactLogger,
     pub addr: SocketAddr,
     //connection_events: UnboundedSender<NetworkEvent>,
     lookup: Arc<ArcSwap<ActorStore>>,
@@ -65,7 +65,7 @@ pub struct NetworkThread {
 
 impl NetworkThread {
     pub fn new(
-        //log: KompactLogger,
+        log: KompactLogger,
         addr: SocketAddr,
         //connection_events: UnboundedSender<NetworkEvent>,
         lookup: Arc<ArcSwap<ActorStore>>,
@@ -93,7 +93,7 @@ impl NetworkThread {
             let mut channel_map: FxHashMap<SocketAddr, TcpChannel> = HashMap::<SocketAddr, TcpChannel, FxBuildHasher>::default();
             let mut token_map: FxHashMap<Token, SocketAddr> = HashMap::<Token, SocketAddr, FxBuildHasher>::default();
             NetworkThread {
-                //log,
+                log,
                 addr: actual_addr,
                 //connection_events,
                 lookup,
@@ -123,7 +123,7 @@ impl NetworkThread {
     // Event loop
     pub fn run(&mut self) -> () {
         let mut events = Events::with_capacity(MAX_POLL_EVENTS);
-        //println!("Network thread starting loop");
+        debug!(self.log, "NetworkThread entering main EventLoop");
         loop {
             self.poll.poll(&mut events, None)
                 .expect("Error when calling Poll");
@@ -135,6 +135,7 @@ impl NetworkThread {
                     //println!("NetworkThread {} got hello from {}", self.addr, &hello_addr);
                     // Listening on the event returned a Hello msg with addr
                     if let Some(registered_addr) = self.token_map.remove(&event.token()) {
+                        debug!(self.log, "NetworkThread {} got Hello from {}", self.addr, &registered_addr);
                         if hello_addr == registered_addr {
                             // The channel is already correct, we update state at the end
                         } else {
@@ -142,7 +143,7 @@ impl NetworkThread {
                                 if let Some(mut other_channel) = self.channel_map.remove(&registered_addr) {
                                     // We already have a channel for the "Hello_addr", this is not great.
                                     // Merge the connections into one
-                                    //println!("Merging connections!");
+                                    debug!(self.log, "NetworkThread {} merging {} into {}", self.addr, &registered_addr, &hello_addr);
                                     channel.merge( &mut other_channel);
                                     self.channel_map.insert(hello_addr, channel );
 
@@ -174,7 +175,7 @@ impl NetworkThread {
                 }
                 if self.stopped {
                     self.network_thread_sender.send(true);
-                    //println!("{} Stopped!", self.addr);
+                    debug!(self.log, "NetworkThread {} Stopped", self.addr);
                     return
                 };
             }
@@ -249,15 +250,13 @@ impl NetworkThread {
                     self.poll.register(channel.stream(), channel.token.clone(), Ready::readable(), PollOpt::edge() | PollOpt::oneshot());
                 }
                 Err(ref err) if no_buffer_space(err) => {
-                    //println!("no buffer space");
+                    debug!(self.log, "NetworkThread {} no_buffer_space for channel to {}", self.addr, &addr);
                     // Buffer full, we swap it and register for poll again
                     if let Some(mut new_buffer) = self.buffer_pool.get_buffer() {
                         channel.swap_buffer(&mut new_buffer);
                         self.buffer_pool.return_buffer(new_buffer);
                     }
-                    //println!("buffers swapped, try_read again");
-                    // Handle this event again without continuing the current method invocation
-                    //return self.try_read(addr);
+                    // The poll will activate again if the bytes are still there
                     self.poll.register(channel.stream(), channel.token.clone(), Ready::readable(), PollOpt::edge() | PollOpt::oneshot());
                 }
                 Err(err) if interrupted(&err) || would_block(&err) => {
@@ -265,6 +264,7 @@ impl NetworkThread {
                     self.poll.register(channel.stream(), channel.token.clone(), Ready::readable(), PollOpt::edge() | PollOpt::oneshot());
                 }
                 Err(err) if connection_reset(&err) => {
+                    debug!(self.log, "NetworkThread {} Connection_reset to peer {}, shutting down the channel", self.addr, &addr);
                     channel.shutdown();
                     self.dispatcher_ref.tell(
                         DispatchEnvelope::Event(
@@ -273,7 +273,7 @@ impl NetworkThread {
                 }
                 Err(err) => {
                     // Fatal error don't try to read again
-                    println!("network thread {} Error while reading, received msgs: {}\n {:?}", self.addr, self.received_msgs, err);
+                    debug!(self.log, "NetworkThread {} Error while reading from peer {}:\n{:?}", self.addr, &addr, &err);
                 }
             }
             let mut msgs = 0;
@@ -308,6 +308,7 @@ impl NetworkThread {
                         return Some(hello.addr());
                     },
                     Frame::Bye() => {
+                        debug!(self.log, "NetworkThread {} received Bye from {}", self.addr, &addr);
                         channel.shutdown();
                         self.dispatcher_ref.tell(
                             DispatchEnvelope::Event(
@@ -315,7 +316,7 @@ impl NetworkThread {
                                     NetworkEvent::Connection(*addr, ConnectionState::Closed))));
                     }
                     _ => {
-                        println!("Unexpected frame type");
+                        debug!(self.log, "NetworkThread {} unexpected frame type from {}", self.addr, &addr);
                     },
                 }
             }
@@ -324,15 +325,15 @@ impl NetworkThread {
     }
 
     fn request_stream(&mut self, addr: SocketAddr) -> io::Result<bool> {
-        //println!("{} Requesting stream", self.addr);
+        debug!(self.log, "NetworkThread {} requesting connection to {}", self.addr, &addr);
         let stream = TcpStream::connect(&addr)?;
         self.store_stream(stream, &addr);
         Ok(true)
     }
 
     fn accept_stream(&mut self) -> io::Result<bool> {
-        //println!("{} Accepting stream", self.addr);
         while let (stream, addr) = self.listener.accept()? {
+            debug!(self.log, "NetworkThread {} accepting connection from {}", self.addr, &addr);
             self.store_stream(stream, &addr);
         }
         Ok(true)
@@ -342,7 +343,7 @@ impl NetworkThread {
         if let Some(buffer) = self.buffer_pool.get_buffer() {
             self.token_map.insert(self.token.clone(), addr.clone());
             let mut channel = TcpChannel::new(stream, self.token, buffer);
-            //println!("{} Initializing stream", self.addr);
+            debug!(self.log, "NetworkThread {} saying Hello to {}", self.addr, &addr);
             channel.initialize(&self.addr);
             self.poll.register(channel.stream(), self.token.clone(), Ready::readable() | Ready::writable(), PollOpt::edge() | PollOpt::oneshot());
             self.channel_map.insert(
@@ -394,7 +395,7 @@ impl NetworkThread {
     }
 
     fn stop(&mut self) -> () {
-        //println!("{} Stopping", self.addr);
+        debug!(self.log, "NetworkThread {} Stopping...", self.addr);
         let tokens = self.token_map.clone();
         for (_, addr) in tokens {
             self.try_read(&addr);
