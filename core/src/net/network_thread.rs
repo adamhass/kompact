@@ -135,7 +135,7 @@ impl NetworkThread {
                     //println!("NetworkThread {} got hello from {}", self.addr, &hello_addr);
                     // Listening on the event returned a Hello msg with addr
                     if let Some(registered_addr) = self.token_map.remove(&event.token()) {
-                        debug!(self.log, "NetworkThread {} got Hello from {}", self.addr, &registered_addr);
+                        debug!(self.log, "NetworkThread {} got Hello({}) from {}", self.addr, &hello_addr, &registered_addr);
                         if hello_addr == registered_addr {
                             // The channel is already correct, we update state at the end
                         } else {
