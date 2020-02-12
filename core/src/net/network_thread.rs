@@ -159,7 +159,6 @@ impl NetworkThread {
 
                         // Make sure that the channel is registered correctly and in Connected State.
                         if let Some(channel) = self.channel_map.get_mut(&hello_addr) {
-                            self.poll.register(channel.stream(), event.token(),Ready::readable() | Ready::writable(), PollOpt::edge() | PollOpt::oneshot());
                             channel.state = ConnectionState::Connected(hello_addr);
                             channel.token = event.token();
                             self.token_map.insert(event.token(), hello_addr);
@@ -172,6 +171,7 @@ impl NetworkThread {
                     } else {
                         panic!("No address registered for a token which yielded a hello msg");
                     }
+                    self.try_read(&hello_addr);
                 }
                 if self.stopped {
                     self.network_thread_sender.send(true);
