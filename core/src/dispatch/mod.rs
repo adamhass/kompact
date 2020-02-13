@@ -218,7 +218,7 @@ impl NetworkDispatcher {
         //println!("on_conn_state for addr {}", &addr);
         match state {
             Connected(ref mut frame_sender) => {
-                debug!(
+                info!(
                     self.ctx().log(),
                     "registering newly connected conn at {:?}", addr
                 );
@@ -227,6 +227,7 @@ impl NetworkDispatcher {
                         // Drain as much as possible
                         while let Some(frame) = qm.pop_frame(&addr) {
                             if let Some(bridge) = &self.net_bridge {
+                                //println!("Sending queued frame to newly established connection");
                                 bridge.route(addr, frame);
                             }
                             /*if let Err(err) = frame_sender.unbounded_send(frame) {
