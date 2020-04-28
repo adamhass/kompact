@@ -2,7 +2,7 @@ use crate::net::buffer::{BufferChunk, Chunk, DefaultChunk};
 use std::collections::VecDeque;
 
 /// The number of Buffers each pool will Pre-allocate
-pub const INITIAL_BUFFER_LEN: usize = 5;
+pub const INITIAL_BUFFER_LEN: usize = 1;
 const MAX_POOL_SIZE: usize = 10000;
 
 /// Methods required by a ChunkAllocator
@@ -34,10 +34,11 @@ pub(crate) struct BufferPool {
     returned: VecDeque<BufferChunk>,
     pool_size: usize,
     chunk_allocator: Box<dyn ChunkAllocator>,
+    reuse: bool,
 }
 
 impl BufferPool {
-    pub fn new() -> Self {
+    pub fn new(reuse: bool) -> Self {
         let mut pool = VecDeque::<BufferChunk>::new();
         let chunk_allocator = Box::new(DefaultAllocator::default());
         for _ in 0..INITIAL_BUFFER_LEN {
@@ -48,6 +49,7 @@ impl BufferPool {
             returned: VecDeque::new(),
             pool_size: INITIAL_BUFFER_LEN,
             chunk_allocator,
+            reuse,
         }
     }
 
@@ -63,6 +65,7 @@ impl BufferPool {
             returned: VecDeque::new(),
             pool_size: INITIAL_BUFFER_LEN,
             chunk_allocator,
+            reuse: true,
         }
     }
 
@@ -71,10 +74,12 @@ impl BufferPool {
     }
 
     pub fn get_buffer(&mut self) -> Option<BufferChunk> {
-        if let Some(new_buffer) = self.pool.pop_front() {
-            return Some(new_buffer);
-        }
-        self.try_reclaim()
+        if self.reuse {
+            if let Some(new_buffer) = self.pool.pop_front() {
+                return Some(new_buffer);
+            }
+            self.try_reclaim()
+        } else {Some(self.new_buffer())}
     }
 
     pub fn return_buffer(&mut self, buffer: BufferChunk) -> () {

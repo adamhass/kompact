@@ -130,7 +130,7 @@ impl NetworkThread {
                         token_map,
                         token: START_TOKEN,
                         input_queue: Box::new(input_queue),
-                        buffer_pool: BufferPool::new(),
+                        buffer_pool: BufferPool::new(false),
                         sent_bytes: 0,
                         received_bytes: 0,
                         sent_msgs: 0,
