@@ -258,7 +258,7 @@ pub struct EncodeBuffer {
 impl EncodeBuffer {
     /// Creates a new EncodeBuffer, allocates a new BufferPool.
     pub fn new() -> Self {
-        let mut buffer_pool = BufferPool::new(true);
+        let mut buffer_pool = BufferPool::new(false);
         if let Some(buffer) = buffer_pool.get_buffer() {
             EncodeBuffer {
                 buffer,
