@@ -79,7 +79,13 @@ impl BufferPool {
                 return Some(new_buffer);
             }
             self.try_reclaim()
-        } else {Some(self.new_buffer())}
+        } else {
+            // We still need to do garbage collection
+            if let Some(trash) = self.try_reclaim() {
+                // implicitly dropped
+            }
+            Some(self.new_buffer())
+        }
     }
 
     pub fn return_buffer(&mut self, buffer: BufferChunk) -> () {
@@ -99,6 +105,7 @@ impl BufferPool {
                 }
             }
         }
+        if !self.reuse {None} // lets us use the method for GC
         self.increase_pool()
     }
 
