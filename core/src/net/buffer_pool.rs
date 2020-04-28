@@ -105,7 +105,7 @@ impl BufferPool {
                 }
             }
         }
-        if !self.reuse {None} // lets us use the method for GC
+        if !self.reuse {return None;} // lets us use the method for GC
         self.increase_pool()
     }
 
