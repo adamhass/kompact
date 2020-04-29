@@ -80,9 +80,11 @@ impl BufferPool {
             }
             self.try_reclaim()
         } else {
-            // We still need to do garbage collection
-            if let Some(trash) = self.try_reclaim() {
-                // implicitly dropped
+            // This is a brutish GC method but it's sufficient for reasoning about performance.
+            for _ in 0..2 { //
+                if let Some(trash) = self.try_reclaim() {
+                    std::mem::drop(trash);
+                }
             }
             Some(self.new_buffer())
         }
@@ -105,7 +107,6 @@ impl BufferPool {
                 }
             }
         }
-        if !self.reuse {return None;} // lets us use the method for GC
         self.increase_pool()
     }
 
