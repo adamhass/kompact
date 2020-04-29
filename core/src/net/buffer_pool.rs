@@ -79,7 +79,15 @@ impl BufferPool {
                 return Some(new_buffer);
             }
             self.try_reclaim()
-        } else {Some(self.new_buffer())}
+        } else {
+            // This is a brutish GC method but it's sufficient for reasoning about performance.
+            for _ in 0..2 { //
+                if let Some(trash) = self.try_reclaim() {
+                    std::mem::drop(trash);
+                }
+            }
+            Some(self.new_buffer())
+        }
     }
 
     pub fn return_buffer(&mut self, buffer: BufferChunk) -> () {
