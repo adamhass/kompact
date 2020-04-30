@@ -86,6 +86,7 @@ impl BufferPool {
                     std::mem::drop(trash);
                 }
             }
+            eprintln!("allocating new buffer");
             Some(self.new_buffer())
         }
     }
