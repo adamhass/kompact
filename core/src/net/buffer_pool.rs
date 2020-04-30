@@ -35,7 +35,7 @@ pub(crate) struct BufferPool {
     pool_size: usize,
     chunk_allocator: Box<dyn ChunkAllocator>,
     reuse: bool,
-    allocations: usize;
+    allocations: usize,
 }
 
 impl BufferPool {
@@ -68,6 +68,7 @@ impl BufferPool {
             pool_size: INITIAL_BUFFER_LEN,
             chunk_allocator,
             reuse: true,
+            allocations: INITIAL_BUFFER_LEN,
         }
     }
 
