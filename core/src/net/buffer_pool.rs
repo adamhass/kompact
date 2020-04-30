@@ -35,6 +35,7 @@ pub(crate) struct BufferPool {
     pool_size: usize,
     chunk_allocator: Box<dyn ChunkAllocator>,
     reuse: bool,
+    allocations: usize,
 }
 
 impl BufferPool {
@@ -50,6 +51,7 @@ impl BufferPool {
             pool_size: INITIAL_BUFFER_LEN,
             chunk_allocator,
             reuse,
+            allocations: INITIAL_BUFFER_LEN,
         }
     }
 
@@ -66,10 +68,13 @@ impl BufferPool {
             pool_size: INITIAL_BUFFER_LEN,
             chunk_allocator,
             reuse: true,
+            allocations: INITIAL_BUFFER_LEN,
         }
     }
 
-    fn new_buffer(&self) -> BufferChunk {
+    fn new_buffer(&mut self) -> BufferChunk {
+        self.allocations += 1;
+        eprintln!("allocating new buffer {}", self.allocations);
         BufferChunk::from_chunk(self.chunk_allocator.get_chunk())
     }
 
@@ -80,14 +85,15 @@ impl BufferPool {
             }
             self.try_reclaim()
         } else {
+            // Try to make sure the Buffer is allocated first, if the compiler or hardware figures out an optimization so be it...
+            let mut new_buf = self.new_buffer();
             // This is a brutish GC method but it's sufficient for reasoning about performance.
             for _ in 0..2 { //
                 if let Some(trash) = self.try_reclaim() {
                     std::mem::drop(trash);
                 }
             }
-            eprintln!("allocating new buffer");
-            Some(self.new_buffer())
+            Some(new_buf)
         }
     }
 
@@ -108,7 +114,9 @@ impl BufferPool {
                 }
             }
         }
-        self.increase_pool()
+        if !self.reuse {
+            self.increase_pool()
+        } else {None}
     }
 
     fn increase_pool(&mut self) -> Option<BufferChunk> {
