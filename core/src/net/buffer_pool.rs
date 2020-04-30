@@ -2,7 +2,7 @@ use crate::net::buffer::{BufferChunk, Chunk, DefaultChunk};
 use std::collections::VecDeque;
 
 /// The number of Buffers each pool will Pre-allocate
-pub const INITIAL_BUFFER_LEN: usize = 5;
+pub const INITIAL_BUFFER_LEN: usize = 1;
 const MAX_POOL_SIZE: usize = 10000;
 
 /// Methods required by a ChunkAllocator
@@ -67,6 +67,7 @@ impl BufferPool {
     }
 
     fn new_buffer(&self) -> BufferChunk {
+        eprintln!("allocating new buffer");
         BufferChunk::from_chunk(self.chunk_allocator.get_chunk())
     }
 
