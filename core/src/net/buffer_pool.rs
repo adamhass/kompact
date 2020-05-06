@@ -87,12 +87,7 @@ impl BufferPool {
         } else {
             // Try to make sure the Buffer is allocated first, if the compiler or hardware figures out an optimization so be it...
             let mut new_buf = self.new_buffer();
-            // This is a brutish GC method but it's sufficient for reasoning about performance.
-            for _ in 0..2 { //
-                if let Some(trash) = self.try_reclaim() {
-                    std::mem::drop(trash);
-                }
-            }
+            self.garbage_collect();
             Some(new_buf)
         }
     }
@@ -114,9 +109,20 @@ impl BufferPool {
                 }
             }
         }
-        if !self.reuse {
-            self.increase_pool()
-        } else {None}
+        self.increase_pool()
+    }
+
+    /// Tries to deallocate old buffers
+    fn garbage_collect(&mut self) -> () {
+        for _i in 0..self.returned.len() {
+            if let Some(mut trash) = self.returned.pop_front() {
+                if trash.free() {
+                    std::mem::drop(trash);
+                } else {
+                    self.returned.push_back(trash);
+                }
+            }
+        }
     }
 
     fn increase_pool(&mut self) -> Option<BufferChunk> {
