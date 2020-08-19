@@ -74,7 +74,6 @@ impl BufferPool {
 
     fn new_buffer(&mut self) -> BufferChunk {
         self.allocations += 1;
-        eprintln!("allocating new buffer {}", self.allocations);
         BufferChunk::from_chunk(self.chunk_allocator.get_chunk())
     }
 
