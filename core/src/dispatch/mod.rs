@@ -34,6 +34,7 @@ use lookup::{ActorLookup, ActorStore, InsertResult, LookupResult};
 use queue_manager::QueueManager;
 use rustc_hash::FxHashMap;
 use std::{collections::VecDeque, io::ErrorKind, time::Duration};
+use crate::net::{NetworkStatusPort, NetworkStatusRequest};
 
 pub mod lookup;
 pub mod queue_manager;
@@ -236,6 +237,8 @@ pub struct NetworkDispatcher {
     /// Stores the number of retry-attempts for connections. Checked and incremented periodically by the reaper.
     retry_map: FxHashMap<SocketAddr, u8>,
     garbage_buffers: VecDeque<BufferChunk>,
+    /// The dispatcher emits NetworkStatusUpdates to the `NetworkStatusPort`.
+    network_status_port: ProvidedPort<NetworkStatusPort>,
 }
 
 impl NetworkDispatcher {
@@ -847,6 +850,17 @@ impl ComponentLifecycle for NetworkDispatcher {
         info!(self.ctx.log(), "Killing network...");
         self.kill();
         info!(self.ctx.log(), "Killed network.");
+        Handled::Ok
+    }
+}
+
+impl Provide<NetworkStatusPort> for NetworkDispatcher {
+    fn handle(&mut self, event: <NetworkStatusPort as Port>::Request) -> Handled {
+        match event {
+            NetworkStatusRequest::ConnectedSystems => {}
+            NetworkStatusRequest::DisconnectedSystems => {}
+            NetworkStatusRequest::CloseChannel(_) => {}
+        }
         Handled::Ok
     }
 }

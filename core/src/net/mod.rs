@@ -21,6 +21,50 @@ pub(crate) mod network_channel;
 pub(crate) mod network_thread;
 pub(crate) mod udp_state;
 
+
+/// A port providing `NetworkStatusUpdates´ to listeners.
+pub struct NetworkStatusPort;
+impl Port for NetworkStatusPort {
+    type Indication = NetworkStatusUpdate;
+    type Request = NetworkStatusRequest;
+}
+
+/// Information regarding changes to the systems connections to remote systems
+pub enum NetworkStatusUpdate {
+    /// Indicates that a connection has been established to the remote system
+    ConnectionEstablished(SocketAddr),
+    /// Indicates that a connection has been lost to the remote system.
+    /// The system will automatically try to recover the connection for a configurable amount of
+    /// retries. The end of the automatic retries is signalled by a `ConnectionDropped` message.
+    ConnectionLost(SocketAddr),
+    /// Indicates that a connection has been dropped and no more automatic retries to re-establish
+    /// the connection will be attempted and all queued messages have been dropped.
+    ConnectionDropped(SocketAddr),
+    /// Indicates that a connection has been gracefully closed.
+    ConnectionClosed(SocketAddr),
+    /// The list includes all remote systems which the system is currently connected to.
+    /// Sent as response to `NetworkStatusRequest::RemoteSystems`.
+    ConnectedSystems(Array<SocketAddr>),
+    /// A list of all remote systems which the system is currently trying to attempting
+    /// to establish connections to.
+    DisconnectedSystems(Array<SocketAddr>),
+    /// Indicates that the configured maximum number of channels has been reached.
+    MaxChannelsReached,
+    /// Indicates that the local `NetworkThread` is out of buffers, inbound data may be blocked
+    /// until buffers have been freed.
+    NetworkOutOfBuffers,
+}
+
+pub enum NetworkStatusRequest {
+    /// Requests a list of all connected remote systems.
+    ConnectedSystems,
+    /// Request a list of all remote systems which the local system is attempting to (re-)establish
+    /// a connection to.
+    DisconnectedSystems,
+    /// Request that the Channel to the given address is closed.
+    CloseChannel(SocketAddr),
+}
+
 /// The state of a connection
 #[derive(Debug)]
 pub enum ConnectionState {
