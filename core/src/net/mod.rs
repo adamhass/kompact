@@ -22,20 +22,18 @@ pub(crate) mod network_thread;
 pub(crate) mod udp_state;
 
 /// The state of a connection
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum ConnectionState {
     /// Newly created
     New,
-    /// Initialising the connection
+    /// Still initialising
     Initializing,
-    /// Connected
+    /// Connected with a confirmed canonical SocketAddr
     Connected,
     /// Closed gracefully, by request on either side
     Closed,
     /// Unexpected lost connection
     Lost,
-    // Threw an error
-    // Error(std::io::Error),
 }
 
 pub(crate) enum Protocol {
@@ -1115,7 +1113,7 @@ pub mod net_test_helpers {
     #[derive(ComponentDefinition)]
     pub struct NetworkStatusCounter {
         ctx: ComponentContext<NetworkStatusCounter>,
-        /// The NetworkStatusPort, needs to be exposed to allow connecting to it
+        /// Allow connecting to the systems `NetworkStatusPort`
         pub network_status_port: RequiredPort<NetworkStatusPort>,
         /// Counts the number of connection_established messages received
         pub connection_established: u32,
@@ -1157,6 +1155,16 @@ pub mod net_test_helpers {
             debug!(self.ctx.log(), "Sending Status Request. {:?}", request);
             self.network_status_port.trigger(request);
         }
+
+        /*
+        pub fn ask_connection_status(&self) {
+            debug!(self.ctx.log(), "Asking connection status");
+            self.network_status_port.trigger()
+                .ask_with(ConnectionStatusAsk).wait();
+            for conn in connections {
+
+            }
+        }*/
     }
 
     impl ComponentLifecycle for NetworkStatusCounter {

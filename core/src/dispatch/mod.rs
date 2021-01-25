@@ -506,7 +506,7 @@ impl NetworkDispatcher {
     ) -> Result<(), NetworkBridgeErr> {
         use self::ConnectionState::*;
         match state {
-            Connected => {
+            ConnectionState::Connected => {
                 info!(
                     self.ctx().log(),
                     "registering newly connected conn at {:?}", addr
@@ -918,8 +918,8 @@ impl Dispatcher for NetworkDispatcher {
         }
     }
 
-    fn network_status_port(&mut self) -> &mut ProvidedPort<NetworkStatusPort> {
-        &mut self.network_status_port
+    fn connect_network_status_port(&mut self, required: &mut RequiredPort<NetworkStatusPort>) -> () {
+        utils::biconnect_ports(&mut self.network_status_port, required);
     }
 }
 
