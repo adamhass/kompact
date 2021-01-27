@@ -18,6 +18,7 @@ use crate::{
 use hocon::{Hocon, HoconLoader};
 use oncemutex::{OnceMutex, OnceMutexGuard};
 use std::{any::TypeId, fmt, sync::Mutex};
+use crate::prelude::NetworkStatusPort;
 
 /// A Kompact system is a collection of components and services
 ///
@@ -640,6 +641,18 @@ impl KompactSystem {
     pub fn start(&self, c: &Arc<impl AbstractComponent + ?Sized>) -> () {
         self.inner.assert_not_poisoned();
         c.enqueue_control(ControlEvent::Start);
+    }
+
+    /// Subscribes the given component to the systems `NetworkStatusPort`.
+    pub fn connect_network_status_port<C>(&self, component: &Arc<Component<C>>) -> ()
+    where
+        C: ComponentDefinition + Sized + 'static + Require<NetworkStatusPort> + RequireRef<NetworkStatusPort>,
+    {
+        component.on_definition(|component|{
+            let req: RequiredRef<NetworkStatusPort> = component.required_ref();
+            // Connect it to inner provided_ref.
+            self.inner.connect_network_status_port(req);
+        })
     }
 
     /// Start a component and complete a future once it has started
@@ -1522,6 +1535,8 @@ pub trait SystemComponents: Send + Sync + 'static {
     fn type_id(&self) -> TypeId {
         TypeId::of::<Self>()
     }
+    /// Allow subscribing to `NetworkStatusUpdate` messages
+    fn connect_network_status_port(&self, required_ref: RequiredRef<NetworkStatusPort>) -> ();
 }
 
 impl dyn SystemComponents {
@@ -1582,6 +1597,10 @@ impl InternalComponents {
 
     fn dispatcher_ref(&self) -> DispatcherRef {
         self.system_components.dispatcher_ref()
+    }
+
+    fn connect_network_status_port(&self, required_ref: RequiredRef<NetworkStatusPort>) -> () {
+        self.system_components.connect_network_status_port(required_ref);
     }
 
     fn system_path(&self) -> SystemPath {
@@ -1735,6 +1754,13 @@ impl KompactRuntime {
     fn dispatcher_ref(&self) -> DispatcherRef {
         match *self.internal_components {
             Some(ref sc) => sc.dispatcher_ref(),
+            None => panic!("KompactRuntime was not properly initialised!"),
+        }
+    }
+
+    fn connect_network_status_port(&self, required_ref: RequiredRef<NetworkStatusPort>) -> () {
+        match *self.internal_components {
+            Some(ref sc) => sc.connect_network_status_port(required_ref),
             None => panic!("KompactRuntime was not properly initialised!"),
         }
     }

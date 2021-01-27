@@ -21,50 +21,6 @@ pub(crate) mod network_channel;
 pub(crate) mod network_thread;
 pub(crate) mod udp_state;
 
-
-/// A port providing `NetworkStatusUpdates´ to listeners.
-pub struct NetworkStatusPort;
-impl Port for NetworkStatusPort {
-    type Indication = NetworkStatusUpdate;
-    type Request = NetworkStatusRequest;
-}
-
-/// Information regarding changes to the systems connections to remote systems
-pub enum NetworkStatusUpdate {
-    /// Indicates that a connection has been established to the remote system
-    ConnectionEstablished(SocketAddr),
-    /// Indicates that a connection has been lost to the remote system.
-    /// The system will automatically try to recover the connection for a configurable amount of
-    /// retries. The end of the automatic retries is signalled by a `ConnectionDropped` message.
-    ConnectionLost(SocketAddr),
-    /// Indicates that a connection has been dropped and no more automatic retries to re-establish
-    /// the connection will be attempted and all queued messages have been dropped.
-    ConnectionDropped(SocketAddr),
-    /// Indicates that a connection has been gracefully closed.
-    ConnectionClosed(SocketAddr),
-    /// The list includes all remote systems which the system is currently connected to.
-    /// Sent as response to `NetworkStatusRequest::RemoteSystems`.
-    ConnectedSystems(Array<SocketAddr>),
-    /// A list of all remote systems which the system is currently trying to attempting
-    /// to establish connections to.
-    DisconnectedSystems(Array<SocketAddr>),
-    /// Indicates that the configured maximum number of channels has been reached.
-    MaxChannelsReached,
-    /// Indicates that the local `NetworkThread` is out of buffers, inbound data may be blocked
-    /// until buffers have been freed.
-    NetworkOutOfBuffers,
-}
-
-pub enum NetworkStatusRequest {
-    /// Requests a list of all connected remote systems.
-    ConnectedSystems,
-    /// Request a list of all remote systems which the local system is attempting to (re-)establish
-    /// a connection to.
-    DisconnectedSystems,
-    /// Request that the Channel to the given address is closed.
-    CloseChannel(SocketAddr),
-}
-
 /// The state of a connection
 #[derive(Debug)]
 pub enum ConnectionState {
@@ -386,7 +342,6 @@ pub mod net_test_helpers {
         fmt::{Debug, Formatter},
         time::{SystemTime, UNIX_EPOCH},
     };
-
     /// The number of Ping-Pong messages, used in assertions and Pingers/BigPingers
     pub const PING_COUNT: u64 = 10;
 
@@ -1126,6 +1081,79 @@ pub mod net_test_helpers {
                 },
                 !Err(e) => error!(self.ctx.log(), "Error deserialising BigPingMsg: {:?}", e),
             }}
+            Handled::Ok
+        }
+    }
+
+    /// Actor which can subscribe to the `NetworkStatusPort` and maintains a counter of how many
+    /// of each kind of NetworkStatusUpdate has been received.
+    #[derive(ComponentDefinition)]
+    pub struct NetworkStatusCounter {
+        ctx: ComponentContext<NetworkStatusCounter>,
+        network_status_port: RequiredPort<NetworkStatusPort>,
+        /// Counts the number of connection_established messages received
+        pub connection_established: u32,
+        /// Counts the number of connection_lost messages received
+        pub connection_lost: u32,
+        /// Counts the number of connection_dropped messages received
+        pub connection_dropped: u32,
+        /// Counts the number of connection_closed messages received
+        pub connection_closed: u32,
+        /// Counts the number of connected_systems messages received
+        pub connected_systems: u32,
+        /// Counts the number of disconnected_systems messages received
+        pub disconnected_systems: u32,
+        /// Counts the number of max_channels_reached messages received
+        pub max_channels_reached: u32,
+        /// Counts the number of network_out_of_buffers messages received
+        pub network_out_of_buffers: u32,
+
+    }
+
+    ignore_lifecycle!(NetworkStatusCounter);
+
+    impl NetworkStatusCounter {
+        /// Creates a new uninitialised NetworkStatusCounter with all counters set to 0
+        pub fn new() -> NetworkStatusCounter {
+            Self {
+                ctx: ComponentContext::uninitialised(),
+                network_status_port: RequiredPort::<NetworkStatusPort>::uninitialised(),
+                connection_established: 0,
+                connection_lost: 0,
+                connection_dropped: 0,
+                connection_closed: 0,
+                connected_systems: 0,
+                disconnected_systems: 0,
+                max_channels_reached: 0,
+                network_out_of_buffers: 0,
+            }
+        }
+    }
+
+    impl Actor for NetworkStatusCounter {
+        type Message = ();
+
+        fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+            unimplemented!()
+        }
+
+        fn receive_network(&mut self, _msg: NetMessage) -> Handled {
+            unimplemented!("Ignoring network messages.");
+        }
+    }
+
+    impl Require<NetworkStatusPort> for NetworkStatusCounter {
+        fn handle(&mut self, event: <NetworkStatusPort as Port>::Indication) -> Handled {
+            match event {
+                NetworkStatusUpdate::ConnectionEstablished(_) => {self.connection_established += 1}
+                NetworkStatusUpdate::ConnectionLost(_) => {self.connection_lost += 1}
+                NetworkStatusUpdate::ConnectionDropped(_) => {self.connection_dropped += 1}
+                NetworkStatusUpdate::ConnectionClosed(_) => {self.connection_closed += 1}
+                NetworkStatusUpdate::ConnectedSystems(_) => {self.connected_systems += 1}
+                NetworkStatusUpdate::DisconnectedSystems(_) => {self.disconnected_systems += 1}
+                NetworkStatusUpdate::MaxChannelsReached => {self.max_channels_reached += 1}
+                NetworkStatusUpdate::NetworkOutOfBuffers => {self.network_out_of_buffers += 1}
+            }
             Handled::Ok
         }
     }

@@ -34,7 +34,6 @@ use lookup::{ActorLookup, ActorStore, InsertResult, LookupResult};
 use queue_manager::QueueManager;
 use rustc_hash::FxHashMap;
 use std::{collections::VecDeque, io::ErrorKind, time::Duration};
-use crate::net::{NetworkStatusPort, NetworkStatusRequest};
 
 pub mod lookup;
 pub mod queue_manager;
@@ -203,6 +202,52 @@ impl Default for NetworkConfig {
     }
 }
 
+/// A port providing `NetworkStatusUpdates´ to listeners.
+pub struct NetworkStatusPort;
+impl Port for NetworkStatusPort {
+    type Indication = NetworkStatusUpdate;
+    type Request = NetworkStatusRequest;
+}
+
+/// Information regarding changes to the systems connections to remote systems
+#[derive(Clone, Debug)]
+pub enum NetworkStatusUpdate {
+    /// Indicates that a connection has been established to the remote system
+    ConnectionEstablished(SocketAddr),
+    /// Indicates that a connection has been lost to the remote system.
+    /// The system will automatically try to recover the connection for a configurable amount of
+    /// retries. The end of the automatic retries is signalled by a `ConnectionDropped` message.
+    ConnectionLost(SocketAddr),
+    /// Indicates that a connection has been dropped and no more automatic retries to re-establish
+    /// the connection will be attempted and all queued messages have been dropped.
+    ConnectionDropped(SocketAddr),
+    /// Indicates that a connection has been gracefully closed.
+    ConnectionClosed(SocketAddr),
+    /// The list includes all remote systems which the system is currently connected to.
+    /// Sent as response to `NetworkStatusRequest::RemoteSystems`.
+    ConnectedSystems(Vec<SocketAddr>),
+    /// A list of all remote systems which the system is currently trying to attempting
+    /// to establish connections to.
+    DisconnectedSystems(Vec<SocketAddr>),
+    /// Indicates that the configured maximum number of channels has been reached.
+    MaxChannelsReached,
+    /// Indicates that the local `NetworkThread` is out of buffers, inbound data may be blocked
+    /// until buffers have been freed.
+    NetworkOutOfBuffers,
+}
+
+/// Sent by Actors and Components to request information about the Network
+#[derive(Clone, Debug)]
+pub enum NetworkStatusRequest {
+    /// Requests a list of all connected remote systems.
+    ConnectedSystems,
+    /// Request a list of all remote systems which the local system is attempting to (re-)establish
+    /// a connection to.
+    DisconnectedSystems,
+    /// Request that the Channel to the given address is closed.
+    CloseChannel(SocketAddr),
+}
+
 /// A network-capable dispatcher for sending messages to remote actors
 ///
 /// Construct this using [NetworkConfig](NetworkConfig::build).
@@ -283,6 +328,7 @@ impl NetworkDispatcher {
             notify_ready: Some(notify_ready),
             garbage_buffers: VecDeque::new(),
             retry_map: Default::default(),
+            network_status_port: ProvidedPort::uninitialised(),
         }
     }
 
@@ -416,6 +462,7 @@ impl NetworkDispatcher {
                 );
                 self.queue_manager.drop_queue(&addr);
                 self.connections.remove(&addr);
+                self.network_status_port.trigger(NetworkStatusUpdate::ConnectionDropped(addr));
             }
         }
         self.schedule_once(
@@ -462,6 +509,7 @@ impl NetworkDispatcher {
                     self.ctx().log(),
                     "registering newly connected conn at {:?}", addr
                 );
+                self.network_status_port.trigger(NetworkStatusUpdate::ConnectionEstablished(addr));
                 let _ = self.retry_map.remove(&addr);
                 if self.queue_manager.has_data(&addr) {
                     // Drain as much as possible
@@ -478,6 +526,7 @@ impl NetworkDispatcher {
                     warn!(self.ctx().log(), "connection closed for {:?}", addr);
                     self.retry_map.insert(addr, 0); // Make sure we try to re-establish the connection
                 }
+                self.network_status_port.trigger(NetworkStatusUpdate::ConnectionLost(addr));
                 // Ack the close message
                 if let Some(bridge) = &self.net_bridge {
                     bridge.ack_closed(addr)?;

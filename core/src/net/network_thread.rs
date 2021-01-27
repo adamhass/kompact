@@ -91,7 +91,7 @@ impl NetworkThread {
     /// The `input_queue` is used to send DispatchEvents to the thread but they won't be read unless
     /// the `dispatcher_registration` is activated to wake up the thread.
     /// `network_thread_sender` is used to confirm shutdown of the thread.
-    pub fn new(
+    pub(crate) fn new(
         log: KompactLogger,
         addr: SocketAddr,
         lookup: Arc<ArcSwap<ActorStore>>,
