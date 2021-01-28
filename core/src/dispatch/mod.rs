@@ -813,6 +813,22 @@ impl NetworkDispatcher {
             RegistrationPromise::None => (), // ignore
         }
     }
+
+    fn close_channel(&mut self, address: SocketAddr) -> () {
+        debug!(self.ctx.log(), "Received CloseChannel request for {}", address);
+        if let Some(state) = self.connections.get_mut(&address) {
+            match state {
+                ConnectionState::Connected(_) => {
+                    if let Some(bridge) = &self.net_bridge {
+                        if let Err(e) = bridge.close_channel(address) {
+                            error!(self.ctx.log(), "Bridge error closing channel {:?}", e);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl Actor for NetworkDispatcher {
@@ -905,10 +921,13 @@ impl ComponentLifecycle for NetworkDispatcher {
 
 impl Provide<NetworkStatusPort> for NetworkDispatcher {
     fn handle(&mut self, event: <NetworkStatusPort as Port>::Request) -> Handled {
+        debug!(self.ctx.log(), "Received NetworkStatusPort Request {:?}", event);
         match event {
             NetworkStatusRequest::ConnectedSystems => {}
             NetworkStatusRequest::DisconnectedSystems => {}
-            NetworkStatusRequest::CloseChannel(_) => {}
+            NetworkStatusRequest::CloseChannel(addr) => {
+                self.close_channel(addr);
+            }
         }
         Handled::Ok
     }

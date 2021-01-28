@@ -30,8 +30,10 @@ pub enum ConnectionState {
     Initializing,
     /// Connected with a confirmed canonical SocketAddr
     Connected(SocketAddr),
-    /// Already closed
+    /// Closed gracefully, by request on either side
     Closed,
+    /// Unexpected lost connection
+    Lost,
     /// Threw an error
     Error(std::io::Error),
 }
@@ -83,6 +85,8 @@ pub mod events {
         Connect(SocketAddr),
         /// Acknowledges a closed channel, required to ensure FIFO ordering under connection loss
         ClosedAck(SocketAddr),
+        /// Tells the `NetworkThread` to gracefully close the channel to the `SocketAddr`
+        Close(SocketAddr),
     }
 
     /// Errors emitted byt the network `Bridge`
@@ -274,6 +278,14 @@ impl Bridge {
         self.waker.wake()?;
         Ok(())
     }
+
+    /// Requests that the NetworkThread should be closed
+    pub fn close_channel(&self, addr: SocketAddr) -> Result<(), NetworkBridgeErr> {
+        self.network_input_queue
+            .send(events::DispatchEvent::Close(addr))?;
+        self.waker.wake()?;
+        Ok(())
+    }
 }
 
 /// Errors which the NetworkBridge might return, not used for now.
@@ -342,6 +354,7 @@ pub mod net_test_helpers {
         fmt::{Debug, Formatter},
         time::{SystemTime, UNIX_EPOCH},
     };
+
     /// The number of Ping-Pong messages, used in assertions and Pingers/BigPingers
     pub const PING_COUNT: u64 = 10;
 
@@ -1127,6 +1140,12 @@ pub mod net_test_helpers {
                 max_channels_reached: 0,
                 network_out_of_buffers: 0,
             }
+        }
+
+        /// triggers the given `request` on the NetworkStatusPort
+        pub fn send_status_request(&mut self, request: NetworkStatusRequest) {
+            debug!(self.ctx.log(), "Sending Status Request {:?}", request);
+            self.network_status_port.trigger(request);
         }
     }
 

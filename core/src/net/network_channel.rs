@@ -30,6 +30,10 @@ pub(crate) enum ChannelState {
     Initialised(SocketAddr, Uuid),
     /// The channel is ready to be used. Ack must be sent before anything else is sent
     Connected(SocketAddr, Uuid),
+    /// Local system initiated a graceful Channel Close, a Bye message must be sent and received
+    CloseRequested(SocketAddr, Uuid),
+    /// Remote system has initiated a graceful Channel Close, a Bye message must be sent
+    CloseReceived(SocketAddr, Uuid),
     /// The channel is closing, will be dropped once the local `NetworkDispatcher` Acks the closing.
     Closed(SocketAddr, Uuid),
 }
@@ -210,21 +214,59 @@ impl TcpChannel {
         }
     }
 
-    pub fn graceful_shutdown(&mut self) -> () {
+    /// Clears the outbound queue (except for the head of the queue), enqueues
+    /// a Bye message, and attempts to drain the message, returning Ok if the bye was sent
+    pub fn clear_outbound_and_send_bye(&mut self) -> io::Result<()> {
         let mut bye = Frame::Bye();
         let mut bye_bytes = BytesMut::with_capacity(128);
         let len = bye.encoded_len() + FRAME_HEAD_LEN as usize;
         bye_bytes.truncate(len);
-        //hello_bytes.extend_from_slice(&[0;hello.encoded_len()]);
         if let Ok(()) = bye.encode_into(&mut bye_bytes) {
-            self.outbound_queue
-                .push_back(SerialisedFrame::Bytes(bye_bytes.freeze()));
+            let head = self.outbound_queue.pop_front();
+            self.outbound_queue.clear();
+            if let Some(msg) = head {
+                // Reinsert the current head of the queue it may be a partial frame which needs to
+                // complete its send
+                self.outbound_queue.push_front(msg)
+            }
+            self.outbound_queue.push_back(SerialisedFrame::Bytes(bye_bytes.freeze()));
             let _ = self.try_drain(); // Try to drain outgoing
-            let _ = self.receive(); // Try to drain incoming
         } else {
             panic!("Unable to send bye bytes, failed to encode!");
         }
-        self.shutdown();
+        if !self.outbound_queue.is_empty() {
+            // Need to wait for the message to be sent again
+            return io::Result::Err(Error::new(ErrorKind::Interrupted, "not sent"));
+        } else {
+            return io::Result::Ok(())
+        }
+    }
+
+    /// Handles a Bye message. If the method returns Ok it is safe to shutdown.
+    pub fn handle_bye(&mut self) -> io::Result<()> {
+        match self.state {
+            ChannelState::Connected(addr, id) => {
+                self.state = ChannelState::CloseReceived(addr, id);
+                self.clear_outbound_and_send_bye()
+            },
+            _ => {
+                // Any other state means we just shut it down.
+                io::Result::Ok(())
+            }
+        }
+    }
+
+    /// If the channel is in connected the channel transitions to CloseRequested
+    /// and calls `clear_outbound_and_send_bye()`
+    /// If the method returns Ok() it must wait for a Bye message to be received.
+    pub fn initiate_graceful_shutdown(&mut self) -> io::Result<()> {
+        return match self.state {
+            ChannelState::Connected(addr, id) => {
+                self.state = ChannelState::CloseRequested(addr, id);
+                self.clear_outbound_and_send_bye()
+            },
+            _ => {io::Result::Ok(())},
+        };
     }
 
     /// Returns `true` if this channel was not in [ChannelState::Connected](ChannelState::Connected)
@@ -364,6 +406,18 @@ impl std::fmt::Debug for ChannelState {
                 .field("id", id)
                 .finish(),
             ChannelState::Closed(addr, id) => f
+                .debug_struct("ChannelState")
+                .field("State", &1)
+                .field("addr", addr)
+                .field("id", id)
+                .finish(),
+            ChannelState::CloseRequested(addr, id) => f
+                .debug_struct("ChannelState")
+                .field("State", &1)
+                .field("addr", addr)
+                .field("id", id)
+                .finish(),
+            ChannelState::CloseReceived(addr, id) => f
                 .debug_struct("ChannelState")
                 .field("State", &1)
                 .field("addr", addr)

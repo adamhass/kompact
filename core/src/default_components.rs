@@ -5,7 +5,6 @@ use crate::{
 };
 use std::sync::Arc;
 use crate::dispatch::NetworkStatusPort;
-use crate::prelude::Any;
 use std::any::TypeId;
 
 pub(crate) struct DefaultComponents {
@@ -139,18 +138,17 @@ where
     fn connect_network_status_port(&self, required_ref: RequiredRef<NetworkStatusPort>) {
         self.dispatcher.on_definition(|d| {
             if let Some(any_port) = d.get_provided_port_as_any(TypeId::of::<NetworkStatusPort>()) {
-                let mut port_opt: Option<&mut ProvidedPort::<NetworkStatusPort>> = any_port.downcast_mut();
+                let port_opt: Option<&mut ProvidedPort::<NetworkStatusPort>> = any_port.downcast_mut();
                 if let Some(network_status_port) = port_opt {
                     network_status_port.connect(required_ref);
                     return;
                 } else {
-                    panic!("Failed Downcast");
+                    panic!("NetworkStatusPort connection failed");
                 }
             } else {
                 panic!("The Systems Dispatcher does not expose a NetworkStatusPort");
             }
         });
-
     }
 }
 
