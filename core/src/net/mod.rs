@@ -1142,7 +1142,7 @@ pub mod net_test_helpers {
 
         /// triggers the given `request` on the NetworkStatusPort
         pub fn send_status_request(&mut self, request: NetworkStatusRequest) {
-            debug!(self.ctx.log(), "Sending Status Request {:?}", request);
+            debug!(self.ctx.log(), "Sending Status Request. {:?}", request);
             self.network_status_port.trigger(request);
         }
     }
