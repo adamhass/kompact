@@ -1123,8 +1123,6 @@ pub mod net_test_helpers {
 
     }
 
-    ignore_lifecycle!(NetworkStatusCounter);
-
     impl NetworkStatusCounter {
         /// Creates a new uninitialised NetworkStatusCounter with all counters set to 0
         pub fn new() -> NetworkStatusCounter {
@@ -1149,6 +1147,16 @@ pub mod net_test_helpers {
         }
     }
 
+    impl ComponentLifecycle for NetworkStatusCounter {
+        fn on_start(&mut self) -> Handled{
+            Handled::Ok
+        }
+
+        fn on_stop(&mut self) -> Handled{ Handled::Ok }
+
+        fn on_kill(&mut self) -> Handled { Handled::Ok }
+    }
+
     impl Actor for NetworkStatusCounter {
         type Message = ();
 
@@ -1163,6 +1171,8 @@ pub mod net_test_helpers {
 
     impl Require<NetworkStatusPort> for NetworkStatusCounter {
         fn handle(&mut self, event: <NetworkStatusPort as Port>::Indication) -> Handled {
+            self.send_status_request(NetworkStatusRequest::ConnectedSystems);
+
             match event {
                 NetworkStatusUpdate::ConnectionEstablished(_) => {self.connection_established += 1}
                 NetworkStatusUpdate::ConnectionLost(_) => {self.connection_lost += 1}

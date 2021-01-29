@@ -922,6 +922,7 @@ impl ComponentLifecycle for NetworkDispatcher {
 impl Provide<NetworkStatusPort> for NetworkDispatcher {
     fn handle(&mut self, event: <NetworkStatusPort as Port>::Request) -> Handled {
         debug!(self.ctx.log(), "Received NetworkStatusPort Request {:?}", event);
+        self.kill();
         match event {
             NetworkStatusRequest::ConnectedSystems => {}
             NetworkStatusRequest::DisconnectedSystems => {}

@@ -1118,9 +1118,10 @@ fn network_status_port_close_connection_and_receive_closed() {
     // The systems establish a connection and the pings/pongs are sent
     thread::sleep(Duration::from_millis(1000));
 
+    /*
     status_counter.on_definition(|sc| {
         sc.send_status_request(NetworkStatusRequest::CloseChannel(remote_socket_addr));
-    });
+    }); */
     // Wait for the channel to be closed
     thread::sleep(Duration::from_millis(5000));
     status_counter.on_definition(|sc| {
