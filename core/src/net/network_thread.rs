@@ -560,6 +560,7 @@ impl NetworkThread {
             if channel.handle_bye().is_ok() {
                 // Channel has been closed entirely
                 debug!(self.log, "Connection shutdown gracefully, awaiting dispatcher Ack");
+
                 self.dispatcher_ref.tell(DispatchEnvelope::Event(EventEnvelope::Network(
                     NetworkEvent::Connection(*addr, ConnectionState::Closed),
                 )));
@@ -935,7 +936,7 @@ impl NetworkThread {
         if let Some(channel) = self.channel_map.get_mut(&addr) {
             self.dispatcher_ref
                 .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                    NetworkEvent::Connection(addr, ConnectionState::Closed),
+                    NetworkEvent::Connection(addr, ConnectionState::Lost),
                 )));
             for rejected_frame in channel.take_outbound() {
                 self.dispatcher_ref

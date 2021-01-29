@@ -234,11 +234,11 @@ impl TcpChannel {
         } else {
             panic!("Unable to send bye bytes, failed to encode!");
         }
-        if !self.outbound_queue.is_empty() {
-            // Need to wait for the message to be sent again
-            return io::Result::Err(Error::new(ErrorKind::Interrupted, "not sent"));
-        } else {
+        if self.outbound_queue.is_empty() {
             return io::Result::Ok(())
+        } else {
+            // Need to wait for the message to be sent again
+            return io::Result::Err(Error::new(ErrorKind::Interrupted, "bye not sent"));
         }
     }
 
@@ -247,7 +247,10 @@ impl TcpChannel {
         match self.state {
             ChannelState::Connected(addr, id) => {
                 self.state = ChannelState::CloseReceived(addr, id);
-                self.clear_outbound_and_send_bye()
+                self.clear_outbound_and_send_bye()?;
+                // Bye has been sent and received, channel is now closed
+                self.state = ChannelState::Closed(addr, id);
+                Ok(())
             },
             _ => {
                 // Any other state means we just shut it down.

@@ -1171,7 +1171,7 @@ pub mod net_test_helpers {
 
     impl Require<NetworkStatusPort> for NetworkStatusCounter {
         fn handle(&mut self, event: <NetworkStatusPort as Port>::Indication) -> Handled {
-            self.send_status_request(NetworkStatusRequest::ConnectedSystems);
+            debug!(self.ctx.log(), "Got NetworkStatusPort indication. {:?}", event);
 
             match event {
                 NetworkStatusUpdate::ConnectionEstablished(_) => {self.connection_established += 1}

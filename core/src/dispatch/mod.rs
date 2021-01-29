@@ -522,12 +522,8 @@ impl NetworkDispatcher {
                 }
             }
             Closed => {
-                if self.retry_map.get(&addr).is_none() {
-                    warn!(self.ctx().log(), "connection closed for {:?}", addr);
-                    self.retry_map.insert(addr, 0); // Make sure we try to re-establish the connection
-                }
-                self.network_status_port.trigger(NetworkStatusUpdate::ConnectionLost(addr));
-                // Ack the close message
+                self.network_status_port.trigger(NetworkStatusUpdate::ConnectionClosed(addr));
+                // Ack the closing
                 if let Some(bridge) = &self.net_bridge {
                     bridge.ack_closed(addr)?;
                 }
@@ -546,6 +542,17 @@ impl NetworkDispatcher {
                             "connection error for {:?}: {:?}", addr, why
                         );
                     }
+                }
+            }
+            Lost => {
+                if self.retry_map.get(&addr).is_none() {
+                    warn!(self.ctx().log(), "connection lost to {:?}", addr);
+                    self.retry_map.insert(addr, 0); // Make sure we try to re-establish the connection
+                }
+                self.network_status_port.trigger(NetworkStatusUpdate::ConnectionLost(addr));
+                // Ack the closing
+                if let Some(bridge) = &self.net_bridge {
+                    bridge.ack_closed(addr)?;
                 }
             }
             ref _other => (), // Don't care
@@ -815,17 +822,24 @@ impl NetworkDispatcher {
     }
 
     fn close_channel(&mut self, address: SocketAddr) -> () {
-        debug!(self.ctx.log(), "Received CloseChannel request for {}", address);
         if let Some(state) = self.connections.get_mut(&address) {
             match state {
                 ConnectionState::Connected(_) => {
+                    debug!(self.ctx.log(), "Closing channel to connected system {}", address);
                     if let Some(bridge) = &self.net_bridge {
                         if let Err(e) = bridge.close_channel(address) {
                             error!(self.ctx.log(), "Bridge error closing channel {:?}", e);
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    debug!(self.ctx.log(), "Trying to close channel to a system which is not connected {}", address);
+                }
+            }
+        } else {
+            debug!(self.ctx.log(), "Closing channel to unknown system {}", address);
+            for (addr, _) in &self.connections {
+                debug!(self.ctx.log(), "Currently connected to {}", addr);
             }
         }
     }
@@ -922,7 +936,6 @@ impl ComponentLifecycle for NetworkDispatcher {
 impl Provide<NetworkStatusPort> for NetworkDispatcher {
     fn handle(&mut self, event: <NetworkStatusPort as Port>::Request) -> Handled {
         debug!(self.ctx.log(), "Received NetworkStatusPort Request {:?}", event);
-        self.kill();
         match event {
             NetworkStatusRequest::ConnectedSystems => {}
             NetworkStatusRequest::DisconnectedSystems => {}

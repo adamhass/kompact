@@ -55,7 +55,7 @@ impl SystemComponents for DefaultComponents {
         self.deadletter_box.wait_ended();
     }
 
-    fn connect_network_status_port(&self, _: RequiredRef<NetworkStatusPort>) -> () {
+    fn connect_network_status_port(&self, _: &mut RequiredPort<NetworkStatusPort>) -> () {
         unimplemented!("No NetworkDispatcher in DefaultComponents");
     }
 }
@@ -135,12 +135,12 @@ where
         self.deadletter_box.wait_ended();
     }
 
-    fn connect_network_status_port(&self, required_ref: RequiredRef<NetworkStatusPort>) {
+    fn connect_network_status_port(&self, required: &mut RequiredPort<NetworkStatusPort>) -> () {
         self.dispatcher.on_definition(|d| {
             if let Some(any_port) = d.get_provided_port_as_any(TypeId::of::<NetworkStatusPort>()) {
                 let port_opt: Option<&mut ProvidedPort::<NetworkStatusPort>> = any_port.downcast_mut();
-                if let Some(network_status_port) = port_opt {
-                    network_status_port.connect(required_ref);
+                if let Some(provided) = port_opt {
+                    utils::biconnect_ports(provided, required);
                     return;
                 } else {
                     panic!("NetworkStatusPort connection failed");

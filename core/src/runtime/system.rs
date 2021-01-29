@@ -648,10 +648,18 @@ impl KompactSystem {
     where
         C: ComponentDefinition + Sized + 'static + Require<NetworkStatusPort> + RequireRef<NetworkStatusPort>,
     {
-        component.on_definition(|component|{
-            let req: RequiredRef<NetworkStatusPort> = component.required_ref();
-            // Connect it to inner provided_ref.
-            self.inner.connect_network_status_port(req);
+        component.on_definition(|c|{
+            if let Some(any_port) = c.get_required_port_as_any(TypeId::of::<NetworkStatusPort>()) {
+                let port_opt: Option<&mut RequiredPort::<NetworkStatusPort>> = any_port.downcast_mut();
+                if let Some(network_status_port) = port_opt {
+                    self.inner.connect_network_status_port(network_status_port);
+                    return;
+                } else {
+                    panic!("NetworkStatusPort connection failed");
+                }
+            } else {
+                panic!("The Component does not Require a NetworkStatusPort");
+            }
         })
     }
 
@@ -1536,7 +1544,7 @@ pub trait SystemComponents: Send + Sync + 'static {
         TypeId::of::<Self>()
     }
     /// Allow subscribing to `NetworkStatusUpdate` messages
-    fn connect_network_status_port(&self, required_ref: RequiredRef<NetworkStatusPort>) -> ();
+    fn connect_network_status_port(&self, required: &mut RequiredPort<NetworkStatusPort>) -> ();
 }
 
 impl dyn SystemComponents {
@@ -1599,8 +1607,8 @@ impl InternalComponents {
         self.system_components.dispatcher_ref()
     }
 
-    fn connect_network_status_port(&self, required_ref: RequiredRef<NetworkStatusPort>) -> () {
-        self.system_components.connect_network_status_port(required_ref);
+    fn connect_network_status_port(&self, required: &mut RequiredPort<NetworkStatusPort>) -> () {
+        self.system_components.connect_network_status_port(required);
     }
 
     fn system_path(&self) -> SystemPath {
@@ -1758,9 +1766,9 @@ impl KompactRuntime {
         }
     }
 
-    fn connect_network_status_port(&self, required_ref: RequiredRef<NetworkStatusPort>) -> () {
+    fn connect_network_status_port(&self, required: &mut RequiredPort<NetworkStatusPort>) -> () {
         match *self.internal_components {
-            Some(ref sc) => sc.connect_network_status_port(required_ref),
+            Some(ref sc) => sc.connect_network_status_port(required),
             None => panic!("KompactRuntime was not properly initialised!"),
         }
     }
