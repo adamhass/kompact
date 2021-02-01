@@ -462,7 +462,8 @@ impl NetworkDispatcher {
                 );
                 self.queue_manager.drop_queue(&addr);
                 self.connections.remove(&addr);
-                self.network_status_port.trigger(NetworkStatusUpdate::ConnectionDropped(addr));
+                self.network_status_port
+                    .trigger(NetworkStatusUpdate::ConnectionDropped(addr));
             }
         }
         self.schedule_once(
@@ -509,7 +510,8 @@ impl NetworkDispatcher {
                     self.ctx().log(),
                     "registering newly connected conn at {:?}", addr
                 );
-                self.network_status_port.trigger(NetworkStatusUpdate::ConnectionEstablished(addr));
+                self.network_status_port
+                    .trigger(NetworkStatusUpdate::ConnectionEstablished(addr));
                 let _ = self.retry_map.remove(&addr);
                 if self.queue_manager.has_data(&addr) {
                     // Drain as much as possible
@@ -522,7 +524,8 @@ impl NetworkDispatcher {
                 }
             }
             Closed => {
-                self.network_status_port.trigger(NetworkStatusUpdate::ConnectionClosed(addr));
+                self.network_status_port
+                    .trigger(NetworkStatusUpdate::ConnectionClosed(addr));
                 // Ack the closing
                 if let Some(bridge) = &self.net_bridge {
                     bridge.ack_closed(addr)?;
@@ -549,7 +552,8 @@ impl NetworkDispatcher {
                     warn!(self.ctx().log(), "connection lost to {:?}", addr);
                     self.retry_map.insert(addr, 0); // Make sure we try to re-establish the connection
                 }
-                self.network_status_port.trigger(NetworkStatusUpdate::ConnectionLost(addr));
+                self.network_status_port
+                    .trigger(NetworkStatusUpdate::ConnectionLost(addr));
                 // Ack the closing
                 if let Some(bridge) = &self.net_bridge {
                     bridge.ack_closed(addr)?;
@@ -825,7 +829,10 @@ impl NetworkDispatcher {
         if let Some(state) = self.connections.get_mut(&address) {
             match state {
                 ConnectionState::Connected(_) => {
-                    debug!(self.ctx.log(), "Closing channel to connected system {}", address);
+                    debug!(
+                        self.ctx.log(),
+                        "Closing channel to connected system {}", address
+                    );
                     if let Some(bridge) = &self.net_bridge {
                         if let Err(e) = bridge.close_channel(address) {
                             error!(self.ctx.log(), "Bridge error closing channel {:?}", e);
@@ -833,14 +840,17 @@ impl NetworkDispatcher {
                     }
                 }
                 _ => {
-                    debug!(self.ctx.log(), "Trying to close channel to a system which is not connected {}", address);
+                    debug!(
+                        self.ctx.log(),
+                        "Trying to close channel to a system which is not connected {}", address
+                    );
                 }
             }
         } else {
-            debug!(self.ctx.log(), "Closing channel to unknown system {}", address);
-            for (addr, _) in &self.connections {
-                debug!(self.ctx.log(), "Currently connected to {}", addr);
-            }
+            debug!(
+                self.ctx.log(),
+                "Closing channel to unknown system {}", address
+            );
         }
     }
 }
@@ -935,7 +945,10 @@ impl ComponentLifecycle for NetworkDispatcher {
 
 impl Provide<NetworkStatusPort> for NetworkDispatcher {
     fn handle(&mut self, event: <NetworkStatusPort as Port>::Request) -> Handled {
-        debug!(self.ctx.log(), "Received NetworkStatusPort Request {:?}", event);
+        debug!(
+            self.ctx.log(),
+            "Received NetworkStatusPort Request {:?}", event
+        );
         match event {
             NetworkStatusRequest::ConnectedSystems => {}
             NetworkStatusRequest::DisconnectedSystems => {}

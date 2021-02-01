@@ -249,7 +249,13 @@ pub mod prelude {
 
     pub use crate::{
         default_components::{CustomComponents, DeadletterBox, LocalDispatcher},
-        dispatch::{NetworkConfig, NetworkDispatcher, NetworkStatusPort, NetworkStatusUpdate, NetworkStatusRequest},
+        dispatch::{
+            NetworkConfig,
+            NetworkDispatcher,
+            NetworkStatusPort,
+            NetworkStatusRequest,
+            NetworkStatusUpdate,
+        },
         messaging::{
             DispatchEnvelope,
             MsgEnvelope,

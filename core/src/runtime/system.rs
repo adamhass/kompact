@@ -11,6 +11,7 @@ use crate::{
         RegistrationError,
         RegistrationResult,
     },
+    prelude::NetworkStatusPort,
     routing::groups::StorePolicy,
     supervision::{ComponentSupervisor, ListenEvent, SupervisionPort, SupervisorMsg},
     timer::timer_manager::{CanCancelTimers, TimerRefFactory},
@@ -18,7 +19,6 @@ use crate::{
 use hocon::{Hocon, HoconLoader};
 use oncemutex::{OnceMutex, OnceMutexGuard};
 use std::{any::TypeId, fmt, sync::Mutex};
-use crate::prelude::NetworkStatusPort;
 
 /// A Kompact system is a collection of components and services
 ///
@@ -646,20 +646,20 @@ impl KompactSystem {
     /// Subscribes the given component to the systems `NetworkStatusPort`.
     pub fn connect_network_status_port<C>(&self, component: &Arc<Component<C>>) -> ()
     where
-        C: ComponentDefinition + Sized + 'static + Require<NetworkStatusPort> + RequireRef<NetworkStatusPort>,
+        C: ComponentDefinition
+            + Sized
+            + 'static
+            + Require<NetworkStatusPort>
+            + RequireRef<NetworkStatusPort>,
     {
-        component.on_definition(|c|{
-            if let Some(any_port) = c.get_required_port_as_any(TypeId::of::<NetworkStatusPort>()) {
-                let port_opt: Option<&mut RequiredPort::<NetworkStatusPort>> = any_port.downcast_mut();
-                if let Some(network_status_port) = port_opt {
-                    self.inner.connect_network_status_port(network_status_port);
-                    return;
-                } else {
-                    panic!("NetworkStatusPort connection failed");
-                }
-            } else {
-                panic!("The Component does not Require a NetworkStatusPort");
-            }
+        component.on_definition(|c| {
+            let any_port = c
+                .get_required_port_as_any(TypeId::of::<NetworkStatusPort>())
+                .expect("The Component does not Require a NetworkStatusPort");
+            let network_status_port = any_port
+                .downcast_mut()
+                .expect("Unable to access NetworkStatusPort of component");
+            self.inner.connect_network_status_port(network_status_port);
         })
     }
 

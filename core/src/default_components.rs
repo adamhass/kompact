@@ -1,11 +1,10 @@
 use super::*;
 use crate::{
+    dispatch::NetworkStatusPort,
     messaging::{DispatchEnvelope, NetMessage},
     timer::timer_manager::TimerRefFactory,
 };
-use std::sync::Arc;
-use crate::dispatch::NetworkStatusPort;
-use std::any::TypeId;
+use std::{any::TypeId, sync::Arc};
 
 pub(crate) struct DefaultComponents {
     deadletter_box: Arc<Component<DeadletterBox>>,
@@ -137,17 +136,13 @@ where
 
     fn connect_network_status_port(&self, required: &mut RequiredPort<NetworkStatusPort>) -> () {
         self.dispatcher.on_definition(|d| {
-            if let Some(any_port) = d.get_provided_port_as_any(TypeId::of::<NetworkStatusPort>()) {
-                let port_opt: Option<&mut ProvidedPort::<NetworkStatusPort>> = any_port.downcast_mut();
-                if let Some(provided) = port_opt {
-                    utils::biconnect_ports(provided, required);
-                    return;
-                } else {
-                    panic!("NetworkStatusPort connection failed");
-                }
-            } else {
-                panic!("The Systems Dispatcher does not expose a NetworkStatusPort");
-            }
+            let any_port = d
+                .get_provided_port_as_any(TypeId::of::<NetworkStatusPort>())
+                .expect("The Dispatcher does not Provide a NetworkStatusPort");
+            let provided = any_port
+                .downcast_mut()
+                .expect("Unable to access NetworkStatusPort of component");
+            utils::biconnect_ports(provided, required);
         });
     }
 }

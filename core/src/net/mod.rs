@@ -1120,7 +1120,6 @@ pub mod net_test_helpers {
         pub max_channels_reached: u32,
         /// Counts the number of network_out_of_buffers messages received
         pub network_out_of_buffers: u32,
-
     }
 
     impl NetworkStatusCounter {
@@ -1148,13 +1147,17 @@ pub mod net_test_helpers {
     }
 
     impl ComponentLifecycle for NetworkStatusCounter {
-        fn on_start(&mut self) -> Handled{
+        fn on_start(&mut self) -> Handled {
             Handled::Ok
         }
 
-        fn on_stop(&mut self) -> Handled{ Handled::Ok }
+        fn on_stop(&mut self) -> Handled {
+            Handled::Ok
+        }
 
-        fn on_kill(&mut self) -> Handled { Handled::Ok }
+        fn on_kill(&mut self) -> Handled {
+            Handled::Ok
+        }
     }
 
     impl Actor for NetworkStatusCounter {
@@ -1171,17 +1174,20 @@ pub mod net_test_helpers {
 
     impl Require<NetworkStatusPort> for NetworkStatusCounter {
         fn handle(&mut self, event: <NetworkStatusPort as Port>::Indication) -> Handled {
-            debug!(self.ctx.log(), "Got NetworkStatusPort indication. {:?}", event);
+            debug!(
+                self.ctx.log(),
+                "Got NetworkStatusPort indication. {:?}", event
+            );
 
             match event {
-                NetworkStatusUpdate::ConnectionEstablished(_) => {self.connection_established += 1}
-                NetworkStatusUpdate::ConnectionLost(_) => {self.connection_lost += 1}
-                NetworkStatusUpdate::ConnectionDropped(_) => {self.connection_dropped += 1}
-                NetworkStatusUpdate::ConnectionClosed(_) => {self.connection_closed += 1}
-                NetworkStatusUpdate::ConnectedSystems(_) => {self.connected_systems += 1}
-                NetworkStatusUpdate::DisconnectedSystems(_) => {self.disconnected_systems += 1}
-                NetworkStatusUpdate::MaxChannelsReached => {self.max_channels_reached += 1}
-                NetworkStatusUpdate::NetworkOutOfBuffers => {self.network_out_of_buffers += 1}
+                NetworkStatusUpdate::ConnectionEstablished(_) => self.connection_established += 1,
+                NetworkStatusUpdate::ConnectionLost(_) => self.connection_lost += 1,
+                NetworkStatusUpdate::ConnectionDropped(_) => self.connection_dropped += 1,
+                NetworkStatusUpdate::ConnectionClosed(_) => self.connection_closed += 1,
+                NetworkStatusUpdate::ConnectedSystems(_) => self.connected_systems += 1,
+                NetworkStatusUpdate::DisconnectedSystems(_) => self.disconnected_systems += 1,
+                NetworkStatusUpdate::MaxChannelsReached => self.max_channels_reached += 1,
+                NetworkStatusUpdate::NetworkOutOfBuffers => self.network_out_of_buffers += 1,
             }
             Handled::Ok
         }

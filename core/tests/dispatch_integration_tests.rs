@@ -1063,10 +1063,10 @@ fn remote_forwarding_named() {
 #[test]
 fn network_status_port_established_lost_dropped_connection() {
     let mut net_cfg = NetworkConfig::default();
-    net_cfg.set_max_connection_retry_attempts(4);
+    net_cfg.set_max_connection_retry_attempts(6);
     net_cfg.set_connection_retry_interval(1000);
     let local_system = system_from_network_config(net_cfg.clone());
-    let remote_system = system_from_network_config(net_cfg.clone());
+    let remote_system = system_from_network_config(net_cfg);
 
     // Create a status_counter which will listen to the status port and count messages received
     let (status_counter, _scf) = local_system.create_and_register(NetworkStatusCounter::new);
@@ -1078,14 +1078,15 @@ fn network_status_port_established_lost_dropped_connection() {
     let pnf = local_system.register_by_alias(&ponger, "ponger");
     local_system.start(&ponger);
     let ponger_path = pnf.wait_expect(Duration::from_millis(1000), "Ponger failed to register!");
-    let (pinger, _pif) = remote_system.create_and_register(move || PingerAct::new_lazy(ponger_path));
+    let (pinger, _pif) =
+        remote_system.create_and_register(move || PingerAct::new_lazy(ponger_path));
     remote_system.start(&pinger);
     // The systems establish a connection and the pings/pongs are sent
-    thread::sleep(Duration::from_millis(3000));
+    thread::sleep(Duration::from_millis(5000));
 
     // Shutdown the remote system and wait for the connection to be lost and dropped by local_system
     let _ = remote_system.shutdown();
-    thread::sleep(Duration::from_millis(3000));
+    thread::sleep(Duration::from_millis(5000));
 
     // Assert connection lost but not dropped
     status_counter.on_definition(|sc| {
@@ -1094,7 +1095,7 @@ fn network_status_port_established_lost_dropped_connection() {
         assert_eq!(sc.connection_dropped, 0);
     });
     // Wait for connection to be dropped
-    thread::sleep(Duration::from_millis(3000));
+    thread::sleep(Duration::from_millis(5000));
     // Assert dropped
     status_counter.on_definition(|sc| {
         assert_eq!(sc.connection_established, 1);
@@ -1109,7 +1110,7 @@ fn network_status_port_close_connection_and_receive_closed() {
     net_cfg.set_max_connection_retry_attempts(2);
     net_cfg.set_connection_retry_interval(1000);
     let local_system = system_from_network_config(net_cfg.clone());
-    let remote_system = system_from_network_config(net_cfg.clone());
+    let remote_system = system_from_network_config(net_cfg);
 
     // Create a status_counter which will listen to the status port and count messages received
     let (local_status_counter, _lscf) = local_system.create_and_register(NetworkStatusCounter::new);
@@ -1117,7 +1118,8 @@ fn network_status_port_close_connection_and_receive_closed() {
     local_system.start(&local_status_counter);
 
     //
-    let (remote_status_counter, _rscf) = remote_system.create_and_register(NetworkStatusCounter::new);
+    let (remote_status_counter, _rscf) =
+        remote_system.create_and_register(NetworkStatusCounter::new);
     remote_system.connect_network_status_port(&remote_status_counter);
     remote_system.start(&remote_status_counter);
 
@@ -1127,7 +1129,8 @@ fn network_status_port_close_connection_and_receive_closed() {
     local_system.start(&ponger);
     let ponger_path = pnf.wait_expect(Duration::from_millis(1000), "Ponger failed to register!");
     let local_socket_addr = SocketAddr::new(*ponger_path.address(), ponger_path.port());
-    let (pinger, _pif) = remote_system.create_and_register(move || PingerAct::new_lazy(ponger_path));
+    let (pinger, _pif) =
+        remote_system.create_and_register(move || PingerAct::new_lazy(ponger_path));
     remote_system.start(&pinger);
     // The systems establish a connection and the pings/pongs are sent
     thread::sleep(Duration::from_millis(3000));

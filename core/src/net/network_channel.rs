@@ -229,16 +229,17 @@ impl TcpChannel {
                 // complete its send
                 self.outbound_queue.push_front(msg)
             }
-            self.outbound_queue.push_back(SerialisedFrame::Bytes(bye_bytes.freeze()));
+            self.outbound_queue
+                .push_back(SerialisedFrame::Bytes(bye_bytes.freeze()));
             let _ = self.try_drain(); // Try to drain outgoing
         } else {
             panic!("Unable to send bye bytes, failed to encode!");
         }
         if self.outbound_queue.is_empty() {
-            return io::Result::Ok(())
+            io::Result::Ok(())
         } else {
             // Need to wait for the message to be sent again
-            return io::Result::Err(Error::new(ErrorKind::Interrupted, "bye not sent"));
+            io::Result::Err(Error::new(ErrorKind::Interrupted, "bye not sent"))
         }
     }
 
@@ -251,7 +252,7 @@ impl TcpChannel {
                 // Bye has been sent and received, channel is now closed
                 self.state = ChannelState::Closed(addr, id);
                 Ok(())
-            },
+            }
             _ => {
                 // Any other state means we just shut it down.
                 io::Result::Ok(())
@@ -263,13 +264,13 @@ impl TcpChannel {
     /// and calls `clear_outbound_and_send_bye()`
     /// If the method returns Ok() it must wait for a Bye message to be received.
     pub fn initiate_graceful_shutdown(&mut self) -> io::Result<()> {
-        return match self.state {
+        match self.state {
             ChannelState::Connected(addr, id) => {
                 self.state = ChannelState::CloseRequested(addr, id);
                 self.clear_outbound_and_send_bye()
-            },
-            _ => {io::Result::Ok(())},
-        };
+            }
+            _ => io::Result::Ok(()),
+        }
     }
 
     /// Returns `true` if this channel was not in [ChannelState::Connected](ChannelState::Connected)

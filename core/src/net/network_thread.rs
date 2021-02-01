@@ -342,14 +342,20 @@ impl NetworkThread {
                         IOReturn::LostConnection => {
                             // Remove and deregister
                             lost_connection = true;
-                        },
+                        }
                         IOReturn::CloseConnection => {
                             // A bye has been sent and received
-                            debug!(self.log, "Connection shutdown gracefully, awaiting dispatcher Ack");
-                            self.dispatcher_ref.tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                                NetworkEvent::Connection(addr, ConnectionState::Closed),
-                            )));
-                        },
+                            debug!(
+                                self.log,
+                                "Connection shutdown gracefully, awaiting dispatcher Ack"
+                            );
+                            self.dispatcher_ref.tell(DispatchEnvelope::Event(
+                                EventEnvelope::Network(NetworkEvent::Connection(
+                                    addr,
+                                    ConnectionState::Closed,
+                                )),
+                            ));
+                        }
                         _ => {}
                     }
                 }
@@ -559,11 +565,15 @@ impl NetworkThread {
             debug!(self.log, "Handling Bye for {}", addr);
             if channel.handle_bye().is_ok() {
                 // Channel has been closed entirely
-                debug!(self.log, "Connection shutdown gracefully, awaiting dispatcher Ack");
+                debug!(
+                    self.log,
+                    "Connection shutdown gracefully, awaiting dispatcher Ack"
+                );
 
-                self.dispatcher_ref.tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                    NetworkEvent::Connection(*addr, ConnectionState::Closed),
-                )));
+                self.dispatcher_ref
+                    .tell(DispatchEnvelope::Event(EventEnvelope::Network(
+                        NetworkEvent::Connection(*addr, ConnectionState::Closed),
+                    )));
                 // Wait for ClosedAck
             }
         }
