@@ -4,7 +4,7 @@ use crate::{
     actors::{Actor, ActorPath, Dispatcher, DynActorRef, SystemPath, Transport},
     component::{Component, ComponentContext, ExecuteResult},
 };
-use std::{net::SocketAddr, pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc};
 
 use crate::{
     actors::NamedPath,
@@ -22,7 +22,7 @@ use crate::{
         RegistrationEvent,
         RegistrationPromise,
     },
-    net::{buffers::*, events::NetworkEvent, ConnectionState, NetworkBridgeErr},
+    net::{buffers::*, events::NetworkEvent, ConnectionState, NetworkBridgeErr, SocketAddr},
     timer::timer_manager::Timer,
 };
 use arc_swap::ArcSwap;
@@ -950,10 +950,34 @@ impl Provide<NetworkStatusPort> for NetworkDispatcher {
             "Received NetworkStatusPort Request {:?}", event
         );
         match event {
-            NetworkStatusRequest::ConnectedSystems => {}
-            NetworkStatusRequest::DisconnectedSystems => {}
-            NetworkStatusRequest::CloseChannel(addr) => {
-                self.close_channel(addr);
+            NetworkStatusRequest::ConnectedSystems => {
+                let mut response = Vec::new();
+                for (address, state) in self.connections.iter() {
+                    if let ConnectionState::Connected(_) = state {
+                        response.push(*address);
+                    }
+                };
+                self.network_status_port
+                    .trigger(NetworkStatusUpdate::ConnectedSystems(response));
+            }
+            NetworkStatusRequest::DisconnectedSystems => {
+                let mut response = Vec::new();
+                for (address, state) in self.connections.iter() {
+                    match state {
+                        ConnectionState::Closed => {
+                            response.push(*address);
+                        },
+                        ConnectionState::Lost => {
+                            response.push(*address);
+                        },
+                        _ => {}
+                    }
+                };
+                self.network_status_port
+                    .trigger(NetworkStatusUpdate::DisconnectedSystems(response));
+            }
+            NetworkStatusRequest::CloseChannel(address) => {
+                self.close_channel(address);
             }
         }
         Handled::Ok

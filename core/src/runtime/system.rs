@@ -644,6 +644,29 @@ impl KompactSystem {
     }
 
     /// Subscribes the given component to the systems `NetworkStatusPort`.
+    ///
+    /// The status port pushes notifications about the systems Network layer, when new connections
+    /// are set-up, when connections are lost, closed, or dropped. It may also receive requests
+    /// for information about what remote systems the local system is currently connected to.
+    ///
+    /// The `component` must implement [Require](component::Require) for
+    /// [NetworkStatusPort](dispatch::NetworkStatusPort). The system must be set-up with a
+    /// `NetworkingConfig`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use kompact::prelude::*;
+    /// # use kompact::net::net_test_helpers::NetworkStatusCounter;
+    /// let mut cfg = KompactConfig::new();
+    /// cfg.system_components(DeadletterBox::new, {
+    ///     let net_config = NetworkConfig::new("127.0.0.1:0".parse().expect("Address should work"));
+    ///     net_config.build()
+    /// });
+    /// let system = cfg.build().expect("KompactSystem");
+    /// let c = system.create(NetworkStatusCounter::new);
+    /// system.connect_network_status_port(&c);
+    /// ```
     pub fn connect_network_status_port<C>(&self, component: &Arc<Component<C>>) -> ()
     where
         C: ComponentDefinition

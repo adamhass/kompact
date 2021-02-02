@@ -164,7 +164,6 @@ pub mod prelude {
         any::Any,
         convert::{From, Into},
     };
-
     pub use bytes::{Buf, BufMut}; // IntoBuf
 
     pub use kompact_actor_derive::*;
@@ -228,7 +227,10 @@ pub mod prelude {
             Require,
             RequireRef,
         },
-        net::buffers::{BufferConfig, ChunkLease, ChunkRef},
+        net::{
+            SocketAddr,
+            buffers::{BufferConfig, ChunkLease, ChunkRef}
+        },
         ports::{
             Channel,
             DisconnectError,

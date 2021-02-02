@@ -4,8 +4,8 @@ use arc_swap::ArcSwap;
 use dispatch::lookup::ActorStore;
 use net::events::NetworkEvent;
 
-use std::{io, net::SocketAddr, sync::Arc, thread};
-
+use std::{io, sync::Arc, thread};
+pub use std::net::SocketAddr;
 use crate::{
     messaging::DispatchData,
     net::{events::DispatchEvent, frames::*, network_thread::NetworkThread},
@@ -56,10 +56,10 @@ impl From<Transport> for Protocol {
 pub mod events {
 
     use super::ConnectionState;
-    use crate::net::frames::*;
-    use std::net::SocketAddr;
-
-    use crate::messaging::DispatchData;
+    use crate::{
+        messaging::DispatchData,
+        net::{frames::*, SocketAddr},
+    };
 
     /// Network events emitted by the network `Bridge`
     #[derive(Debug)]
@@ -1113,9 +1113,9 @@ pub mod net_test_helpers {
         /// Counts the number of connection_closed messages received
         pub connection_closed: u32,
         /// Counts the number of connected_systems messages received
-        pub connected_systems: u32,
+        pub connected_systems: Vec<SocketAddr>,
         /// Counts the number of disconnected_systems messages received
-        pub disconnected_systems: u32,
+        pub disconnected_systems: Vec<SocketAddr>,
         /// Counts the number of max_channels_reached messages received
         pub max_channels_reached: u32,
         /// Counts the number of network_out_of_buffers messages received
@@ -1132,8 +1132,8 @@ pub mod net_test_helpers {
                 connection_lost: 0,
                 connection_dropped: 0,
                 connection_closed: 0,
-                connected_systems: 0,
-                disconnected_systems: 0,
+                connected_systems: Vec::new(),
+                disconnected_systems: Vec::new(),
                 max_channels_reached: 0,
                 network_out_of_buffers: 0,
             }
@@ -1184,10 +1184,14 @@ pub mod net_test_helpers {
                 NetworkStatusUpdate::ConnectionLost(_) => self.connection_lost += 1,
                 NetworkStatusUpdate::ConnectionDropped(_) => self.connection_dropped += 1,
                 NetworkStatusUpdate::ConnectionClosed(_) => self.connection_closed += 1,
-                NetworkStatusUpdate::ConnectedSystems(_) => self.connected_systems += 1,
-                NetworkStatusUpdate::DisconnectedSystems(_) => self.disconnected_systems += 1,
                 NetworkStatusUpdate::MaxChannelsReached => self.max_channels_reached += 1,
                 NetworkStatusUpdate::NetworkOutOfBuffers => self.network_out_of_buffers += 1,
+                NetworkStatusUpdate::ConnectedSystems(addresses) => {
+                    self.connected_systems = addresses;
+                }
+                NetworkStatusUpdate::DisconnectedSystems(addresses) => {
+                    self.disconnected_systems = addresses;
+                }
             }
             Handled::Ok
         }
