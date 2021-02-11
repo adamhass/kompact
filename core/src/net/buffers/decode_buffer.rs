@@ -65,11 +65,33 @@ impl DecodeBuffer {
         // If the readable portion of the buffer would have less than `encode_buf_min_free_space`
         // Or if we would return less than 8 readable bytes we don't allow further writing into
         // the current buffer, caller must swap.
-        // TODO: Define what is a sensible amount of minimum bytes to be read at any given moment.
-        if self.writeable_len() < 8 {
-            return None;
+        if self.is_writeable() {
+            unsafe { Some(self.buffer.get_slice(self.write_offset, self.buffer.len())) }
+        } else {
+            None
         }
-        unsafe { Some(self.buffer.get_slice(self.write_offset, self.buffer.len())) }
+    }
+
+    /// True if there is sufficient amount of writeable bytes
+    pub(crate) fn is_writeable(&mut self) -> bool {
+        // TODO: Define what is a sensible amount of minimum bytes to be read at any given moment.
+        if self.writeable_len() > 8 {
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns true if there is data to be decoded, else false
+    pub(crate) fn can_decode(&self) -> bool {
+        if let Some(head) = &self.next_frame_head {
+            if self.readable_len() >= head.content_length() {
+                return true;
+            }
+        } else if self.readable_len() >= FRAME_HEAD_LEN as usize {
+            return true;
+        }
+        false
     }
 
     /// Swaps the underlying buffer in place with other
@@ -154,8 +176,6 @@ impl DecodeBuffer {
                     FrameType::Data => {
                         Data::decode_from(chunk_lease).map_err(|_| FramingError::InvalidFrame)
                     }
-                    FrameType::StreamRequest => StreamRequest::decode_from(chunk_lease)
-                        .map_err(|_| FramingError::InvalidFrame),
                     FrameType::Hello => {
                         Hello::decode_from(chunk_lease).map_err(|_| FramingError::InvalidFrame)
                     }

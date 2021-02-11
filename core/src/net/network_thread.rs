@@ -1,6 +1,9 @@
 use super::*;
 use crate::{
-    dispatch::NetworkConfig,
+    dispatch::{
+        lookup::{ActorLookup, LookupResult},
+        NetworkConfig,
+    },
     messaging::{DispatchEnvelope, EventEnvelope},
     net::{
         buffers::{BufferChunk, BufferPool, EncodeBuffer},
@@ -11,29 +14,25 @@ use crate::{
 };
 use crossbeam_channel::Receiver as Recv;
 use mio::{
+    event::Event,
     net::{TcpListener, TcpStream, UdpSocket},
     Events,
     Poll,
     Token,
 };
 use rustc_hash::FxHashMap;
+use serialisation::ser_helpers::deserialise_chunk_lease;
 use std::{
     collections::VecDeque,
     io,
+    io::{Error, ErrorKind},
     net::{Shutdown, SocketAddr},
     sync::Arc,
     time::Duration,
     usize,
 };
 use uuid::Uuid;
-
-/*
-    Using https://github.com/tokio-rs/mio/blob/master/examples/tcp_server.rs as template.
-    Single threaded MIO event loop.
-    Receives outgoing Box<IoVec> via SegQueue, notified by polling via the "Registration"
-    Buffers the outgoing Boxes for different connections in a hashmap.
-    Will Send incoming messages directly to components.
-*/
+use crate::messaging::SerialisedFrame;
 
 // Used for identifying connections
 const TCP_SERVER: Token = Token(0);
@@ -51,14 +50,11 @@ const BIND_RETRY_INTERVAL: u64 = 1000;
 /// Thread structure responsible for driving the Network IO
 pub struct NetworkThread {
     log: KompactLogger,
-    /// The SocketAddr the network thread is bound to and listening on
     pub addr: SocketAddr,
-    //connection_events: UnboundedSender<NetworkEvent>,
     lookup: Arc<ArcSwap<ActorStore>>,
     tcp_listener: Option<TcpListener>,
     udp_state: Option<UdpState>,
     poll: Poll,
-    // Contains K,V=Remote SocketAddr, Output buffer; Token for polling; Input-buffer,
     channel_map: FxHashMap<SocketAddr, TcpChannel>,
     token_map: FxHashMap<Token, SocketAddr>,
     token: Token,
@@ -71,20 +67,35 @@ pub struct NetworkThread {
     stopped: bool,
     shutdown_promise: Option<KPromise<()>>,
     network_config: NetworkConfig,
-    retry_queue: VecDeque<(Token, bool, bool, usize)>,
+    retry_queue: VecDeque<EventWithRetries>,
     out_of_buffers: bool,
     encode_buffer: EncodeBuffer,
 }
 
-/// Return values for IO Operations on the [NetworkChannel](net::network_channel::NetworkChannel) abstraction
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum IoReturn {
-    SwapBuffer,
-    LostConnection,
-    CloseConnection,
-    None,
-    Start(SocketAddr, Uuid),
-    Ack,
+struct EventWithRetries {
+    token: Token,
+    readable: bool,
+    writeable: bool,
+    retries: u8,
+}
+impl EventWithRetries {
+    fn from(event: &Event) -> EventWithRetries {
+        EventWithRetries {
+            token: event.token(),
+            readable: event.is_readable(),
+            writeable: event.is_writable(),
+            retries: 0,
+        }
+    }
+
+    fn get_retry_event(&self) -> EventWithRetries {
+        EventWithRetries {
+            token: self.token,
+            readable: self.readable,
+            writeable: self.writeable,
+            retries: self.retries + 1,
+        }
+    }
 }
 
 impl NetworkThread {
@@ -129,28 +140,21 @@ impl NetworkThread {
                     )
                     .expect("failed to register UDP SOCKET");
 
-                // Create waker for Dispatch
                 let waker = Waker::new(poll.registry(), DISPATCHER)
                     .expect("failed to create Waker for DISPATCHER");
-
                 let mut buffer_pool = BufferPool::with_config(
                     &network_config.get_buffer_config(),
                     &network_config.get_custom_allocator(),
                 );
-
                 let encode_buffer = EncodeBuffer::with_config(
                     &network_config.get_buffer_config(),
                     &network_config.get_custom_allocator(),
                 );
-
                 let udp_buffer = buffer_pool
                     .get_buffer()
                     .expect("Could not get buffer for setting up UDP");
-
                 let udp_state =
                     UdpState::new(udp_socket, udp_buffer, logger.clone(), &network_config);
-                let channel_map: FxHashMap<SocketAddr, TcpChannel> = FxHashMap::default();
-                let token_map: FxHashMap<Token, SocketAddr> = FxHashMap::default();
 
                 (
                     NetworkThread {
@@ -160,8 +164,8 @@ impl NetworkThread {
                         tcp_listener: Some(tcp_listener),
                         udp_state: Some(udp_state),
                         poll,
-                        channel_map,
-                        token_map,
+                        channel_map: FxHashMap::default(),
+                        token_map: FxHashMap::default(),
                         token: START_TOKEN,
                         input_queue,
                         buffer_pool,
@@ -188,63 +192,59 @@ impl NetworkThread {
         }
     }
 
-    /// Event loop, spawn a thread calling this method start the thread.
+    fn get_poll_timeout(&self) -> Option<Duration> {
+        if self.out_of_buffers {
+            Some(Duration::from_millis(
+                self.network_config.get_connection_retry_interval(),
+            ))
+        } else if self.retry_queue.is_empty() {
+            None
+        } else {
+            Some(Duration::from_secs(0))
+        }
+    }
+
     pub fn run(&mut self) -> () {
+        trace!(self.log, "NetworkThread starting");
         let mut events = Events::with_capacity(MAX_POLL_EVENTS);
-        debug!(self.log, "Entering main EventLoop");
-        let mut retry_queue = VecDeque::<(Token, bool, bool, usize)>::new();
-        let mut timeout;
         loop {
             // Retries happen for connection interrupts and buffer-swapping
             // Performed in the main loop to avoid recursion
-            retry_queue.append(&mut self.retry_queue);
-            timeout = if self.out_of_buffers {
-                // Avoid looping retries when there are no Buffers
-                Some(Duration::from_millis(
-                    self.network_config.get_connection_retry_interval(),
-                ))
-            } else if retry_queue.is_empty() {
-                None
-            }
-            // No need to timeout if there are no retries
-            else {
-                Some(Duration::from_secs(0))
-            }; // Timeout immediately if retries are waiting
-
             self.poll
-                .poll(&mut events, timeout)
+                .poll(&mut events, self.get_poll_timeout())
                 .expect("Error when calling Poll");
 
-            for (token, readable, writeable, retries) in events
+            for event in events
                 .iter()
-                .map(|e| (e.token(), e.is_readable(), e.is_writable(), 0_usize))
-                .chain(retry_queue.drain(0..retry_queue.len()))
+                .map(|e| (EventWithRetries::from(e)))
+                .chain(self.retry_queue.split_off(0))
             {
-                self.handle_event(token, readable, writeable, retries);
+                self.handle_event(event);
 
                 if self.stopped {
                     let promise = self.shutdown_promise.take().expect("shutdown promise");
                     if let Err(e) = promise.fulfil(()) {
                         error!(self.log, "Error, shutting down sender: {:?}", e);
                     };
-                    debug!(self.log, "Stopped");
+                    trace!(self.log, "Stopped");
                     return;
                 };
             }
         }
     }
 
-    fn handle_event(&mut self, token: Token, readable: bool, writeable: bool, retries: usize) {
-        match token {
+    fn handle_event(&mut self, event: EventWithRetries) {
+        match event.token {
             TCP_SERVER => {
                 // Received an event for the TCP server socket.Accept the connection.
-                if let Err(e) = self.accept_stream() {
-                    debug!(self.log, "Error while accepting stream {:?}", e);
+                if let Err(e) = self.receive_stream() {
+                    error!(self.log, "Error while accepting stream {:?}", e);
                 }
             }
             UDP_SOCKET => {
+                /*
                 if let Some(ref mut udp_state) = self.udp_state {
-                    if writeable {
+                    if event.writeable {
                         match udp_state.try_write() {
                             Ok(n) => {
                                 self.sent_bytes += n as u64;
@@ -254,7 +254,7 @@ impl NetworkThread {
                             }
                         }
                     }
-                    if readable {
+                    if event.readable {
                         match udp_state.try_read() {
                             Ok((n, ioret)) => {
                                 if n > 0 {
@@ -317,123 +317,130 @@ impl NetworkThread {
                 } else {
                     debug!(self.log, "Poll triggered for removed UDP socket");
                 }
+                */
             }
             DISPATCHER => {
                 // Message available from Dispatcher, clear the poll readiness before receiving
                 self.receive_dispatch();
             }
-            token => {
-                // lookup its corresponding addr
-                let addr = {
-                    if let Some(addr) = self.token_map.get(&token) {
-                        *addr
-                    } else {
-                        debug!(
-                            self.log,
-                            "Poll triggered for removed channel, Token({})", token.0
-                        );
-                        return;
-                    }
-                };
-                let mut swap_buffer = false;
-                let mut lost_connection = false;
-                if writeable {
-                    match self.try_write(&addr) {
-                        IoReturn::LostConnection => {
-                            // Remove and deregister
-                            lost_connection = true;
-                        }
-                        IoReturn::CloseConnection => {
-                            // A bye has been sent and received
-                            debug!(
-                                self.log,
-                                "Connection shutdown gracefully, awaiting dispatcher Ack"
-                            );
-                            self.dispatcher_ref.tell(DispatchEnvelope::Event(
-                                EventEnvelope::Network(NetworkEvent::Connection(
-                                    addr,
-                                    ConnectionState::Closed,
-                                )),
-                            ));
-                        }
-                        _ => {}
-                    }
+            _ => {
+                if event.writeable {
+                    self.handle_writeable_event(&event);
                 }
-                if readable {
-                    match self.try_read(&addr) {
-                        IoReturn::LostConnection => {
-                            // Remove and deregister
-                            lost_connection = true;
-                        }
-                        IoReturn::SwapBuffer => {
-                            swap_buffer = true;
-                        }
-                        _ => {}
-                    }
+                if event.readable {
+                    self.handle_readable_event(&event);
+                }
+            }
+        }
+    }
 
-                    match self.decode(&addr) {
-                        IoReturn::Start(remote_addr, id) => {
-                            self.handle_start(token, remote_addr, id);
+    fn handle_readable_event(&mut self, event: &EventWithRetries) {
+        if let Some(addr) = self.token_map.get(&event.token) {
+            if let Some(mut channel) = self.channel_map.remove(&addr) {
+                loop {
+                    match channel.read_frame(&mut self.buffer_pool) {
+                        Ok(None) => {
+                            self.channel_map.insert(*addr, channel);
+                            return;
                         }
-                        IoReturn::LostConnection => {
-                            // Remove and deregister
-                            lost_connection = true;
+                        Ok(Some(Frame::Data(data))) => {
+                            self.handle_data_frame(data);
                         }
-                        IoReturn::CloseConnection => {
-                            // A bye was received
-                            self.handle_bye(&addr);
+                        Ok(Some(Frame::Start(start))) => {
+                            self.handle_start(event, channel, &start);
+                            return;
                         }
-                        _ => (),
-                    }
-                    if swap_buffer {
-                        // Buffer full, we swap it and register for poll again
-                        if let Some(channel) = self.channel_map.get_mut(&addr) {
-                            if let Some(mut new_buffer) = self.buffer_pool.get_buffer() {
-                                self.out_of_buffers = false;
-                                channel.swap_buffer(&mut new_buffer);
-                                self.buffer_pool.return_buffer(new_buffer);
-                                debug!(
-                                    self.log,
-                                    "Swapped buffer for {:?}, \nbuffer_pool: {:?}",
-                                    &channel,
-                                    &self.buffer_pool
-                                );
-                                // We do not count successful swaps in the retries, stay at the same count
-                                self.retry_queue
-                                    .push_back((token, readable, writeable, retries));
-                            } else if retries
-                                <= self.network_config.get_max_connection_retry_attempts() as usize
-                            {
-                                error!(
-                                    self.log,
-                                    "Could not get buffer for channel {}, retries {}",
-                                    &addr,
-                                    retries
-                                );
-                                self.out_of_buffers = true;
-                                self.retry_queue.push_back((
-                                    token,
-                                    readable,
-                                    writeable,
-                                    retries + 1,
-                                ));
-                            } else {
-                                error!(
-                                    self.log,
-                                    "Giving up on reading channel {}, retries {},\
-                                waiting for buffers timed out",
-                                    &addr,
-                                    retries
-                                );
-                                lost_connection = true;
-                            }
+                        Ok(Some(Frame::Bye())) => {
+                            self.handle_bye(&mut channel);
+                            self.channel_map.insert(*addr, channel);
+                            return;
                         }
-                        // We retry the event such that the read is performed with the new buffer.
-                    }
-                    if lost_connection {
-                        self.lost_connection(addr);
+                        Err(e) if no_buffer_space(&e) => {
+                            self.out_of_buffers = true;
+                            trace!(self.log, "Out of Buffers");
+                            self.channel_map.insert(addr.clone(), channel);
+                            self.retry_event(event);
+                            return;
+                        }
+                        Err(e) => {
+                            error!(self.log, "Error reading from channel {}: {}", &addr, &e);
+                            self.channel_map.insert(*addr, channel);
+                            return;
+                        }
+                        Ok(Some(frame)) => {
+                            error!(self.log, "Unrecognized frame type {:?}", &frame);
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    fn handle_writeable_event(&mut self, event: &EventWithRetries) -> () {
+
+    }
+
+
+    fn try_write(&mut self, address: &SocketAddr) {
+        if let Some(mut channel) = self.channel_map.remove(address) {
+            match channel.try_drain() {
+                Err(ref err) if broken_pipe(err) => {
+                    // Remove the channel
+                    drop(channel);
+                    self.lost_connection(address);
+                    return;
+                }
+                Ok(n) => {
+                    self.sent_bytes += n as u64;
+                    if let ChannelState::CloseReceived(addr, id) = channel.state {
+                        channel.state = ChannelState::Closed(addr, id);
+                        // TODO:
+                    }
+                }
+                Err(e) => {
+                    error!(self.log, "Unhandled error while writing to {}\n{:?}", address, e);
+                }
+            }
+        }
+    }
+
+    fn retry_event(&mut self, event: &EventWithRetries) -> () {
+        if event.retries <= self.network_config.get_max_connection_retry_attempts() {
+            debug!(self.log, "Retrying event, retries: {}", event.retries);
+            self.retry_queue.push_back(event.get_retry_event());
+        } else {
+            trace!(self.log, "Event retried too many times");
+            if let Some(addr) = self.token_map.remove(&event.token) {
+                self.lost_connection(&addr);
+            }
+        }
+    }
+
+    fn handle_data_frame(&self, data: Data) -> () {
+        let lease_lookup = self.lookup.load();
+        let buf = data.payload();
+        let envelope = deserialise_chunk_lease(buf).expect("s11n errors");
+        match lease_lookup.get_by_actor_path(&envelope.receiver) {
+            LookupResult::Ref(actor) => {
+                actor.enqueue(envelope);
+            }
+            LookupResult::Group(group) => {
+                group.route(envelope, &self.log);
+            }
+            LookupResult::None => {
+                warn!(
+                    self.log,
+                    "Could not find actor reference for destination: {:?}, dropping message",
+                    envelope.receiver
+                );
+            }
+            LookupResult::Err(e) => {
+                error!(
+                    self.log,
+                    "An error occurred during local actor lookup for destination: {:?}, dropping message. The error was: {}",
+                    envelope.receiver,
+                    e
+                );
             }
         }
     }
@@ -446,282 +453,80 @@ impl NetworkThread {
     ///     The other connection has not started and does not have a known UUID: it will be killed, this channel will start.
     ///     The connection has already started, in which case this channel must be killed.
     ///     The connection has a known UUID but is not connected: Use the UUID as a tie breaker for which to kill and which to keep.
-    fn handle_start(&mut self, token: Token, remote_addr: SocketAddr, id: Uuid) -> () {
-        if let Some(registered_addr) = self.token_map.remove(&token) {
-            if remote_addr == registered_addr {
-                // The channel we received the start on was already registered with the appropriate address.
-                // There is no need to change anything, we can simply transition the channel.
-                debug!(
-                    self.log,
-                    "Got Start({}, ...) from {}, already registered with correct addr",
-                    &remote_addr,
-                    &registered_addr
-                );
-            } else {
-                // Make sure we only have one channel and that it's registered with the remote_addr
-                if let Some(mut channel) = self.channel_map.remove(&registered_addr) {
-                    // There's a channel registered with the remote_addr
-
-                    if let Some(mut other_channel) = self.channel_map.remove(&remote_addr) {
-                        // There's another channel for the same host, only one can survive.
-                        // If we don't knw the Uuid yet the channel can safely be killed. The remote host must obey our Ack.
-                        // It can not discard the other channel without receiving a Start(...) or Ack(...) for the other channel.
-                        if let Some(other_id) = other_channel.get_id() {
-                            // The other channel has a known id, if it doesn't there is no reason to keep it.
-
-                            if other_channel.connected() || other_id > id || other_channel.closed()
-                            {
-                                // The other channel should be kept and this one should be discarded.
-                                debug!(
-                                    self.log,
-                                    "Got Start({}, ...) from {}, already connected",
-                                    &remote_addr,
-                                    &registered_addr
-                                );
-                                let _ = self.poll.registry().deregister(channel.stream_mut());
-                                let _ = channel.initiate_graceful_shutdown();
-                                self.channel_map.insert(remote_addr, other_channel);
-                                // It will be driven to completion on its own.
-                                return;
-                            }
-                        }
-                        // We will keep this channel, not the other channel
-                        info!(
-                            self.log,
-                            "Dropping other_channel while starting channel {}", &remote_addr
-                        );
-                        let _ = self
-                            .poll
-                            .registry()
-                            .deregister(other_channel.stream_mut())
-                            .ok();
-                        other_channel.shutdown();
-                        drop(other_channel);
-                        // Continue with `channel`
-                    }
-                    // Re-insert the channel and continue starting it.
-                    self.channel_map.insert(remote_addr, channel);
-                } else if let Some(channel) = self.channel_map.remove(&remote_addr) {
-                    // Only one channel, re-insert the channel with the correct key
-                    debug!(
-                        self.log,
-                        "Got Start({}, ...) from {}, changing name of channel.",
-                        &remote_addr,
-                        &registered_addr
-                    );
-                    self.channel_map.insert(remote_addr, channel);
+    fn handle_start(&mut self, event: &EventWithRetries, mut channel: TcpChannel, start: &Start) {
+        if let Some(mut other_channel) = self.channel_map.remove(&start.addr) {
+            debug!(
+                self.log,
+                "Merging channels for remote system {}", &start.addr
+            );
+            if let Some(other_id) = other_channel.get_id() {
+                if other_channel.connected() || other_id > start.id {
+                    // The other channel should be kept and this one should be discarded.
+                    self.drop_channel(channel);
+                    self.channel_map.insert(start.addr, other_channel);
+                    return;
+                } else {
+                    self.drop_channel(other_channel);
                 }
             }
-
-            // Make sure that the channel is registered correctly and in Connected State.
-            if let Some(channel) = self.channel_map.get_mut(&remote_addr) {
-                debug!(
-                    self.log,
-                    "Sending ack for {}, {}", &remote_addr, &channel.token.0
-                );
-                channel.handle_start(&remote_addr, id);
-                channel.token = token;
-                self.token_map.insert(token, remote_addr);
-                if let Err(e) = self.poll.registry().reregister(
-                    channel.stream_mut(),
-                    token,
-                    Interest::WRITABLE | Interest::READABLE,
-                ) {
-                    warn!(
-                        self.log,
-                        "Error when reregistering Poll for channel in handle_hello: {:?}", e
-                    );
-                };
-
-                self.dispatcher_ref
-                    .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                        NetworkEvent::Connection(
-                            remote_addr,
-                            ConnectionState::Connected(remote_addr),
-                        ),
-                    )));
-            }
-        } else {
-            panic!(
-                "No address registered for a token which yielded a hello msg, \
-            should not be possible"
-            );
         }
+        channel.handle_start(&start);
+        channel.token = event.token;
+        self.token_map.insert(event.token, start.addr);
+        if let Err(e) = self.poll.registry().reregister(
+            channel.stream_mut(),
+            event.token,
+            Interest::WRITABLE | Interest::READABLE,
+        ) {
+            error!(
+                self.log,
+                "Error when reregistering Poll for channel in handle_hello: {:?}", e
+            );
+        };
+        self.channel_map.insert(start.addr, channel);
+        self.retry_event(event);
+        self.notify_connection_state(start.addr, ConnectionState::Connected);
+    }
+
+    fn drop_channel(&mut self, mut channel: TcpChannel) {
+        let _ = self.poll.registry().deregister(channel.stream_mut());
+        self.token_map.remove(&channel.token);
+        let _ = channel.shutdown();
     }
 
     fn handle_ack(&mut self, addr: &SocketAddr) -> () {
         if let Some(channel) = self.channel_map.get_mut(addr) {
             debug!(self.log, "Handling ack for {}", addr);
             channel.handle_ack();
-            self.dispatcher_ref
-                .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                    NetworkEvent::Connection(*addr, ConnectionState::Connected(*addr)),
-                )));
+            self.notify_connection_state(*addr, ConnectionState::Connected);
         }
     }
 
-    fn handle_bye(&mut self, addr: &SocketAddr) -> () {
-        if let Some(channel) = self.channel_map.get_mut(addr) {
-            debug!(self.log, "Handling Bye for {}", addr);
-            if channel.handle_bye().is_ok() {
-                // Channel has been closed entirely
-                debug!(
-                    self.log,
-                    "Connection shutdown gracefully, awaiting dispatcher Ack"
-                );
-
-                self.dispatcher_ref
-                    .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                        NetworkEvent::Connection(*addr, ConnectionState::Closed),
-                    )));
-                // Wait for ClosedAck
-            }
+    fn handle_bye(&self, channel: &mut TcpChannel) -> () {
+        debug!(self.log, "Handling Bye for {:?}", &channel);
+        if channel.handle_bye().is_ok() {
+            debug!(
+                self.log,
+                "Connection shutdown gracefully, awaiting dispatcher Ack"
+            );
+            self.notify_connection_state(
+                channel.get_address().expect("must have address"),
+                ConnectionState::Closed,
+            );
         }
     }
 
-    fn try_write(&mut self, addr: &SocketAddr) -> IoReturn {
-        if let Some(channel) = self.channel_map.get_mut(&addr) {
-            match channel.try_drain() {
-                Err(ref err) if broken_pipe(err) => {
-                    return IoReturn::LostConnection;
-                }
-                Ok(n) => {
-                    self.sent_bytes += n as u64;
-                    if let ChannelState::CloseReceived(addr, id) = channel.state {
-                        channel.state = ChannelState::Closed(addr, id);
-                        return IoReturn::CloseConnection;
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        self.log,
-                        "Unhandled error while writing to {}\n{:?}", addr, e
-                    );
-                }
-            }
-        }
-        IoReturn::None
+    fn notify_connection_state(&self, address: SocketAddr, state: ConnectionState) {
+        self.dispatcher_ref
+            .tell(DispatchEnvelope::Event(EventEnvelope::Network(
+                NetworkEvent::Connection(address, state),
+            )));
     }
 
-    fn try_read(&mut self, addr: &SocketAddr) -> IoReturn {
-        let mut ret = IoReturn::None;
-        if let Some(channel) = self.channel_map.get_mut(&addr) {
-            match channel.receive() {
-                Ok(n) => {
-                    self.received_bytes += n as u64;
-                }
-                Err(ref err) if no_buffer_space(err) => {
-                    debug!(self.log, "no_buffer_space for channel {:?}", channel);
-                    ret = IoReturn::SwapBuffer
-                }
-                Err(err) if interrupted(&err) || would_block(&err) => {
-                    // Just retry later
-                }
-                Err(err) if connection_reset(&err) || broken_pipe(&err) => {
-                    debug!(
-                        self.log,
-                        "Connection_reset to peer {}, shutting down the channel", &addr
-                    );
-                    ret = IoReturn::LostConnection
-                }
-                Err(err) => {
-                    // Fatal error don't try to read again
-                    error!(
-                        self.log,
-                        "Error while reading from peer {}:\n{:?}", &addr, &err
-                    );
-                }
-            }
-        }
-        ret
-    }
-
-    fn decode(&mut self, addr: &SocketAddr) -> IoReturn {
-        let mut ret = IoReturn::None;
-        // ret is used as return place-holder and internal flow-control.
-        if let Some(channel) = self.channel_map.get_mut(addr) {
-            loop {
-                match channel.decode() {
-                    Err(FramingError::NoData) => {
-                        // Done
-                        return ret;
-                    }
-                    Ok(Frame::Data(fr)) => {
-                        use dispatch::lookup::{ActorLookup, LookupResult};
-                        use serialisation::ser_helpers::deserialise_chunk_lease;
-
-                        // Forward the data frame to the correct actor
-                        let lease_lookup = self.lookup.load();
-                        let buf = fr.payload();
-                        let envelope = deserialise_chunk_lease(buf).expect("s11n errors");
-                        match lease_lookup.get_by_actor_path(&envelope.receiver) {
-                            LookupResult::Ref(actor) => {
-                                actor.enqueue(envelope);
-                            }
-                            LookupResult::Group(group) => {
-                                group.route(envelope, &self.log);
-                            }
-                            LookupResult::None => {
-                                warn!(self.log, "Could not find actor reference for destination: {:?}, dropping message", envelope.receiver);
-                            }
-                            LookupResult::Err(e) => {
-                                error!(
-                                    self.log,
-                                    "An error occurred during local actor lookup for destination: {:?}, dropping message. The error was: {}",
-                                    envelope.receiver,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    Ok(Frame::Hello(hello)) => {
-                        // Channel handles hello internally. We can continue decoding.
-                        debug!(self.log, "Handling Hello({}) from {}", &hello.addr, &addr);
-                        channel.handle_hello(hello);
-                    }
-                    Ok(Frame::Start(start)) => {
-                        // Channel handles hello internally. NetworkThread decides in next state transition
-                        return IoReturn::Start(start.addr, start.id);
-                    }
-                    Ok(Frame::Ack(_)) => {
-                        // We need to handle Acks immediately outside of the loop, then continue the loop
-                        ret = IoReturn::Ack;
-                        break;
-                    }
-                    Ok(Frame::Bye()) => {
-                        debug!(self.log, "Received Bye from {}", &addr);
-                        return IoReturn::CloseConnection;
-                    }
-                    Err(FramingError::InvalidMagicNum((check, slice))) => {
-                        // There is no way to recover from this error right now. Would need resending mechanism
-                        // or accept data loss and close the channel.
-                        panic!("NetworkThread {} Unaligned buffer error for {}. {:?}, Magic_num: {:X}, Slice:{:?}",
-                               self.addr, &addr, channel, check, slice);
-                    }
-                    Err(FramingError::InvalidFrame) => {
-                        // Bad but not fatal error
-                        error!(self.log, "Invalid Frame received on channel {:?}", channel);
-                    }
-                    Err(e) => {
-                        error!(self.log, "Unhandled error {:?} from {:?}", &e, &addr);
-                    }
-                    Ok(other_frame) => error!(
-                        self.log,
-                        "Received unexpected frame type {:?} from {:?}",
-                        other_frame.frame_type(),
-                        channel
-                    ),
-                }
-            }
-        }
-        match ret {
-            IoReturn::Ack => {
-                self.handle_ack(addr);
-                // We must continue decoding after.
-                self.decode(addr)
-            }
-            _ => ret,
-        }
+    fn reject_dispatch_data(&self, address: SocketAddr, data: DispatchData) {
+        self.dispatcher_ref.tell(DispatchEnvelope::Event(
+            EventEnvelope::Network(NetworkEvent::RejectedData(address, data)),
+        ));
     }
 
     fn request_stream(&mut self, addr: SocketAddr) {
@@ -737,10 +542,7 @@ impl NetworkThread {
                         self.log,
                         "Asked to request connection to already connected host {}", &addr
                     );
-                    self.dispatcher_ref
-                        .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                            NetworkEvent::Connection(addr, ConnectionState::Connected(addr)),
-                        )));
+                    self.notify_connection_state(addr, ConnectionState::Connected);
                     self.channel_map.insert(addr, channel);
                     return;
                 }
@@ -773,6 +575,7 @@ impl NetworkThread {
                     );
                 }
                 Err(e) => {
+                    //  Connection will be re-requested
                     error!(
                         self.log,
                         "Failed to connect to remote host {}, error: {:?}", &addr, e
@@ -780,16 +583,17 @@ impl NetworkThread {
                 }
             }
         } else {
-            // No buffers available, we reject the connection
-            self.dispatcher_ref
-                .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                    NetworkEvent::Connection(addr, ConnectionState::Closed),
-                )));
+            // No buffers available, Connection will be re-requested
+            trace!(
+                self.log,
+                "No Buffers available when attempting to connect to remote host {}",
+                &addr
+            );
         }
     }
 
     #[allow(irrefutable_let_patterns)]
-    fn accept_stream(&mut self) -> io::Result<()> {
+    fn receive_stream(&mut self) -> io::Result<()> {
         while let (stream, addr) = (self.tcp_listener.as_ref().unwrap()).accept()? {
             if let Some(buffer) = self.buffer_pool.get_buffer() {
                 debug!(self.log, "Accepting connection from {}", &addr);
@@ -834,128 +638,98 @@ impl NetworkThread {
 
     fn receive_dispatch(&mut self) {
         while let Ok(event) = self.input_queue.try_recv() {
-            match event {
-                DispatchEvent::SendTcp(addr, data) => {
-                    self.sent_msgs += 1;
-                    // Get the token corresponding to the connection
-                    if let Some(channel) = self.channel_map.get_mut(&addr) {
-                        // The stream is already set-up, buffer the package and wait for writable event
-                        if channel.connected() {
-                            match data {
-                                DispatchData::Serialised(frame) => {
-                                    channel.enqueue_serialised(frame);
-                                }
-                                _ => {
-                                    if let Err(e) = self
-                                        .encode_buffer
-                                        .get_buffer_encoder()
-                                        .and_then(|mut buf| {
-                                            channel.enqueue_serialised(
-                                                data.into_serialised(&mut buf)?,
-                                            );
-                                            Ok(())
-                                        })
-                                    {
-                                        warn!(self.log, "Error serialising message: {}", e);
-                                    }
-                                }
-                            }
-                        } else {
-                            debug!(self.log, "Dispatch trying to route to non connected channel {:?}, rejecting the message", channel);
-                            self.dispatcher_ref.tell(DispatchEnvelope::Event(
-                                EventEnvelope::Network(NetworkEvent::RejectedData(addr, data)),
-                            ));
-                            break;
-                        }
-                    } else {
-                        // The stream isn't set-up, request connection, set-it up and try to send the message
-                        debug!(self.log, "Dispatch trying to route to unrecognized address {}, rejecting the message", addr);
-                        self.dispatcher_ref
-                            .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                                NetworkEvent::RejectedData(addr, data),
-                            )));
-                        break;
-                    }
-                    if let IoReturn::LostConnection = self.try_write(&addr) {
-                        self.lost_connection(addr);
-                    }
+            self.handle_dispatch_event(event);
+        }
+    }
+
+    fn handle_dispatch_event(&mut self, event: DispatchEvent) {
+        match event {
+            DispatchEvent::SendTcp(address, data) => {
+                self.send_tcp_message(address, data);
+            }
+            DispatchEvent::SendUdp(address, data) => {
+                self.send_udp_message(address, data);
+            }
+            DispatchEvent::Stop => {
+                self.stop();
+            }
+            DispatchEvent::Kill => {
+                self.kill();
+            }
+            DispatchEvent::Connect(addr) => {
+                debug!(self.log, "Got DispatchEvent::Connect({})", addr);
+                self.request_stream(addr);
+            }
+            DispatchEvent::ClosedAck(addr) => {
+                debug!(self.log, "Got DispatchEvent::ClosedAck({})", addr);
+                self.handle_closed_ack(addr);
+            }
+            DispatchEvent::Close(addr) => {
+                self.close_connection(addr);
+            }
+        }
+    }
+
+    fn send_tcp_message(&mut self, address: SocketAddr, data: DispatchData) {
+        if let Some(channel) = self.channel_map.get_mut(&address) {
+            // The stream is already set-up, buffer the package and wait for writable event
+            if channel.connected() {
+                if let Ok(frame) = self.serialise_dispatch_data(data) {
+                    channel.enqueue_serialised(frame);
+                    channel.try_drain();
+                } else {
+                    // TODO: Out of Buffers for Lazy-serialisation?
                 }
-                DispatchEvent::SendUdp(addr, data) => {
-                    self.sent_msgs += 1;
-                    // Get the token corresponding to the connection
-                    if let Some(ref mut udp_state) = self.udp_state {
-                        match data {
-                            DispatchData::Serialised(frame) => {
-                                udp_state.enqueue_serialised(addr, frame);
-                            }
-                            _ => {
-                                if let Err(e) =
-                                    self.encode_buffer.get_buffer_encoder().and_then(|mut buf| {
-                                        udp_state.enqueue_serialised(
-                                            addr,
-                                            data.into_serialised(&mut buf)?,
-                                        );
-                                        Ok(())
-                                    })
-                                {
-                                    warn!(self.log, "Error serialising message: {}", e);
-                                }
-                            }
-                        }
-                        match udp_state.try_write() {
-                            Ok(n) => {
-                                self.sent_bytes += n as u64;
-                            }
-                            Err(e) => {
-                                warn!(self.log, "Error during UDP sending: {}", e);
-                                debug!(self.log, "UDP erro debug info: {:?}", e);
-                            }
-                        }
-                    } else {
-                        self.dispatcher_ref
-                            .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                                NetworkEvent::RejectedData(addr, data),
-                            )));
-                        warn!(
-                            self.log,
-                            "Rejecting UDP message to {} as socket is already shut down.", addr
-                        );
+            } else {
+                trace!(self.log, "Dispatch trying to route to non connected channel {:?}, rejecting the message", channel);
+                self.reject_dispatch_data(address, data);
+            }
+        } else {
+            trace!(self.log, "Dispatch trying to route to unrecognized address {}, rejecting the message", address);
+            self.reject_dispatch_data(address, data);
+        }
+    }
+
+    fn send_udp_message(&mut self, address: SocketAddr, data: DispatchData) {
+        if let Some(ref mut udp_state) = self.udp_state {
+            if let Ok(frame) = self.serialise_dispatch_data(data) {
+                udp_state.enqueue_serialised(address, frame);
+                match udp_state.try_write() {
+                    Ok(n) => {
+                        self.sent_bytes += n as u64;
+                    }
+                    Err(e) => {
+                        warn!(self.log, "Error during UDP sending: {}", e);
+                        debug!(self.log, "UDP erro debug info: {:?}", e);
                     }
                 }
-                DispatchEvent::Stop => {
-                    self.stop();
-                }
-                DispatchEvent::Kill => {
-                    self.kill();
-                }
-                DispatchEvent::Connect(addr) => {
-                    debug!(self.log, "Got DispatchEvent::Connect({})", addr);
-                    self.request_stream(addr);
-                }
-                DispatchEvent::ClosedAck(addr) => {
-                    debug!(self.log, "Got DispatchEvent::ClosedAck({})", addr);
-                    self.handle_closed_ack(addr);
-                }
-                DispatchEvent::Close(addr) => {
-                    self.close_connection(addr);
-                }
+            } else {
+                // TODO: Out of Buffers for Lazy-serialisation?
+            }
+        } else {
+            self.reject_dispatch_data(address, data);
+            trace!(self.log, "Rejecting UDP message to {} as socket is already shut down.", address);
+        }
+    }
+
+    fn serialise_dispatch_data(&mut self, data: DispatchData) -> Result<SerialisedFrame, SerError> {
+        match data {
+            DispatchData::Serialised(frame) => {
+                Ok(frame)
+            }
+            _ => {
+                data.into_serialised(&mut self.encode_buffer.get_buffer_encoder()?)
             }
         }
     }
 
     /// Handles all logic necessary to shutdown a channel for which the connection has been lost.
-    fn lost_connection(&mut self, addr: SocketAddr) -> () {
+    fn lost_connection(&mut self, addr: &SocketAddr) -> () {
         // We will only drop the Channel once we get the CloseAck from the NetworkDispatcher
         if let Some(channel) = self.channel_map.get_mut(&addr) {
-            self.dispatcher_ref
-                .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                    NetworkEvent::Connection(addr, ConnectionState::Lost),
-                )));
+            self.notify_connection_state(*addr, ConnectionState::Lost);
             for rejected_frame in channel.take_outbound() {
-                self.dispatcher_ref
-                    .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                        NetworkEvent::RejectedData(addr, DispatchData::Serialised(rejected_frame)),
-                    )));
+                self.reject_dispatch_data(*addr, DispatchData::Serialised(rejected_frame));
             }
             channel.shutdown();
         }
@@ -990,7 +764,7 @@ impl NetworkThread {
     fn stop(&mut self) -> () {
         let tokens = self.token_map.clone();
         for (_, addr) in tokens {
-            self.try_read(&addr);
+            // self.try_read(&addr);
         }
         for (_, mut channel) in self.channel_map.drain() {
             debug!(
@@ -1142,8 +916,8 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         // Accept requested streams
-        thread1.accept_stream();
-        thread2.accept_stream();
+        thread1.receive_stream();
+        thread2.receive_stream();
 
         // Wait for Hello to reach destination:
         thread::sleep(Duration::from_millis(100));
@@ -1206,7 +980,7 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         // 1 accepts the connection and sends hello back
-        thread1.accept_stream();
+        thread1.receive_stream();
         thread::sleep(Duration::from_millis(100));
         // 2 receives the Hello
         poll_and_handle(&mut thread2);
@@ -1221,7 +995,7 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         // 2 accepts the connection and replies with hello
-        thread2.accept_stream();
+        thread2.receive_stream();
         thread::sleep(Duration::from_millis(100));
 
         // 2 receives the Hello on the new channel and merges
