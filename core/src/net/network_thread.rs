@@ -351,7 +351,6 @@ impl NetworkThread {
                 if readable {
                     match self.try_read(&addr) {
                         IoReturn::LostConnection => {
-                            // Remove and deregister
                             lost_connection = true;
                         }
                         IoReturn::SwapBuffer => {
@@ -363,10 +362,6 @@ impl NetworkThread {
                     match self.decode(&addr) {
                         IoReturn::Start(remote_addr, id) => {
                             self.handle_start(token, remote_addr, id);
-                        }
-                        IoReturn::LostConnection => {
-                            // Remove and deregister
-                            lost_connection = true;
                         }
                         IoReturn::CloseConnection => {
                             // A bye was received
@@ -457,9 +452,7 @@ impl NetworkThread {
                         // It can not discard the other channel without receiving a Start(...) or Ack(...) for the other channel.
                         if let Some(other_id) = other_channel.get_id() {
                             // The other channel has a known id, if it doesn't there is no reason to keep it.
-
-                            if other_channel.connected() || other_id > id || other_channel.closed()
-                            {
+                            if other_channel.connected() || other_id > id {
                                 // The other channel should be kept and this one should be discarded.
                                 debug!(
                                     self.log,
@@ -479,11 +472,7 @@ impl NetworkThread {
                             self.log,
                             "Dropping other_channel while starting channel {}", &remote_addr
                         );
-                        let _ = self
-                            .poll
-                            .registry()
-                            .deregister(other_channel.stream_mut())
-                            .ok();
+                        let _ = self.poll.registry().deregister(other_channel.stream_mut());
                         other_channel.shutdown();
                         drop(other_channel);
                         // Continue with `channel`
@@ -759,6 +748,7 @@ impl NetworkThread {
                     );
                 }
                 Err(e) => {
+                    //  Connection will be re-requested
                     error!(
                         self.log,
                         "Failed to connect to remote host {}, error: {:?}", &addr, e
@@ -766,11 +756,12 @@ impl NetworkThread {
                 }
             }
         } else {
-            // No buffers available, we reject the connection
-            self.dispatcher_ref
-                .tell(DispatchEnvelope::Event(EventEnvelope::Network(
-                    NetworkEvent::Connection(addr, ConnectionState::Closed),
-                )));
+            // No buffers available, Connection will be re-requested
+            trace!(
+                self.log,
+                "No Buffers available when attempting to connect to remote host {}",
+                &addr
+            );
         }
     }
 

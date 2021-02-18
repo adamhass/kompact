@@ -85,10 +85,6 @@ impl TcpChannel {
         matches!(self.state, ChannelState::Connected(_, _))
     }
 
-    pub fn closed(&self) -> bool {
-        matches!(self.state, ChannelState::Closed(_, _))
-    }
-
     /// Internal helper function for special frames
     fn send_frame(&mut self, mut frame: Frame) -> () {
         let len = frame.encoded_len() + FRAME_HEAD_LEN as usize;
