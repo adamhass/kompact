@@ -79,6 +79,7 @@ impl UdpState {
         Ok(sent_bytes)
     }
 
+    /*
     pub(super) fn try_read(&mut self) -> io::Result<(usize, IoReturn)> {
         let mut received_bytes: usize = 0;
         let mut interrupts = 0;
@@ -121,6 +122,7 @@ impl UdpState {
             }
         }
     }
+     */
 
     fn decode_message(&mut self, source: SocketAddr) {
         match self.input_buffer.get_frame() {

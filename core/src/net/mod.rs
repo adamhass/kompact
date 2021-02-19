@@ -345,7 +345,7 @@ pub(crate) fn interrupted(err: &io::Error) -> bool {
 }
 
 pub(crate) fn no_buffer_space(err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::InvalidData
+    err.kind() == io::ErrorKind::InvalidInput
 }
 
 pub(crate) fn connection_reset(err: &io::Error) -> bool {

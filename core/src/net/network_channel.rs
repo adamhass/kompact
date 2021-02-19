@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     messaging::SerialisedFrame,
     net::{
-        buffers::{BufferChunk, DecodeBuffer},
+        buffers::{BufferChunk, BufferPool, DecodeBuffer},
         frames::{Ack, Frame, FramingError, Hello, Start, FRAME_HEAD_LEN},
     },
 };
@@ -36,6 +36,20 @@ pub(crate) enum ChannelState {
     CloseReceived(SocketAddr, Uuid),
     /// The channel is closing, will be dropped once the local `NetworkDispatcher` Acks the closing.
     Closed(SocketAddr, Uuid),
+}
+
+impl ChannelState {
+    fn get_address(&self) -> Option<SocketAddr> {
+        match self {
+            ChannelState::Requested(address, _) => Some(address.clone()),
+            ChannelState::Initialising => None,
+            ChannelState::Initialised(address, _) => Some(address.clone()),
+            ChannelState::Connected(address, _) => Some(address.clone()),
+            ChannelState::CloseRequested(address, _) => Some(address.clone()),
+            ChannelState::CloseReceived(address, _) => Some(address.clone()),
+            ChannelState::Closed(address, _) => Some(address.clone()),
+        }
+    }
 }
 
 pub(crate) struct TcpChannel {
@@ -129,7 +143,7 @@ impl TcpChannel {
 
     /// Must be called when we Ack the channel. This means that the sender can start using the channel
     /// The receiver of the Ack must accept the Ack and use the channel.
-    pub fn handle_start(&mut self, addr: &SocketAddr, id: Uuid) -> () {
+    pub fn handle_start(&mut self, start: &Start) -> () {
         if let ChannelState::Initialising = self.state {
             // Method called because we received Start and want to send Ack.
             let ack = Frame::Ack(Ack { offset: 0 }); // we don't use offsets yet.
@@ -137,8 +151,12 @@ impl TcpChannel {
                 .set_nodelay(self.nodelay)
                 .expect("set nodelay failed");
             self.send_frame(ack);
-            self.state = ChannelState::Connected(*addr, id);
+            self.state = ChannelState::Connected(start.addr, start.id);
         }
+    }
+
+    pub fn get_address(&self) -> Option<SocketAddr> {
+        self.state.get_address()
     }
 
     /// Returns true if it transitioned, false if it's not starting.
@@ -169,8 +187,51 @@ impl TcpChannel {
         ret
     }
 
+    /// Performs receive and decode, should be called repeatedly
+    /// May return `Ok(Frame::Data)`, `Ok(Frame::Start)`, `Ok(Frame::Bye)`, or an Error.
+    pub fn read_frame(&mut self, buffer_pool: &mut BufferPool) -> io::Result<Option<Frame>> {
+        if !self.input_buffer.can_decode() {
+            match self.receive() {
+                Ok(n) => {}
+                Err(err) if interrupted(&err) || would_block(&err) => {}
+                Err(err) if no_buffer_space(&err) => {
+                    // Only swap if everything in the current buffer has been decoded
+                    if !&self.input_buffer.can_decode() {
+                        let mut buffer_chunk = buffer_pool.get_buffer().ok_or(err)?;
+                        self.swap_buffer(&mut buffer_chunk);
+                        buffer_pool.return_buffer(buffer_chunk);
+                    }
+                }
+                Err(err) => {
+                    // Return on other errors
+                    return Err(err);
+                }
+            };
+        }
+        let frame = self.decode();
+        match frame {
+            Ok(Frame::Hello(hello)) => {
+                // Handle internally then continue reading
+                self.handle_hello(hello);
+                self.read_frame(buffer_pool)
+            }
+            Ok(Frame::Ack(_)) => {
+                // Handle the Ack internally then continue decoding
+                self.handle_ack();
+                self.read_frame(buffer_pool)
+            }
+            Ok(Frame::Bye()) => {
+                self.handle_bye();
+                Ok(Some(Frame::Bye()))
+            }
+            Ok(frame) => Ok(Some(frame)),
+            Err(FramingError::NoData) => Ok(None),
+            Err(e) => Err(Error::new(ErrorKind::InvalidData, "Framing Error")),
+        }
+    }
+
     /// This tries to read from the Tcp buffer into the DecodeBuffer, nothing else.
-    pub fn receive(&mut self) -> io::Result<usize> {
+    fn receive(&mut self) -> io::Result<usize> {
         let mut read_bytes = 0;
         let mut sum_read_bytes = 0;
         let mut interrupts = 0;
@@ -180,32 +241,32 @@ impl TcpChannel {
                 self.input_buffer.advance_writeable(read_bytes);
                 read_bytes = 0;
             }
-            if let Some(mut buf) = self.input_buffer.get_writeable() {
-                match self.stream.read(&mut buf) {
-                    Ok(0) => {
-                        return Ok(sum_read_bytes);
-                    }
-                    Ok(n) => {
-                        sum_read_bytes += n;
-                        read_bytes = n;
-                        // continue looping and reading
-                    }
-                    Err(err) if would_block(&err) => {
-                        return Ok(sum_read_bytes);
-                    }
-                    Err(err) if interrupted(&err) => {
-                        // We should continue trying until no interruption
-                        interrupts += 1;
-                        if interrupts >= network_thread::MAX_INTERRUPTS {
-                            return Err(err);
-                        }
-                    }
-                    Err(err) => {
+            let mut buf = self
+                .input_buffer
+                .get_writeable()
+                .ok_or(Error::new(ErrorKind::InvalidInput, "No Buffer Space"))?;
+            match self.stream.read(&mut buf) {
+                Ok(0) => {
+                    return Ok(sum_read_bytes);
+                }
+                Ok(n) => {
+                    sum_read_bytes += n;
+                    read_bytes = n;
+                    // continue looping and reading
+                }
+                Err(err) if would_block(&err) => {
+                    return Ok(sum_read_bytes);
+                }
+                Err(err) if interrupted(&err) => {
+                    // We should continue trying until no interruption
+                    interrupts += 1;
+                    if interrupts >= network_thread::MAX_INTERRUPTS {
                         return Err(err);
                     }
                 }
-            } else {
-                return Err(Error::new(ErrorKind::InvalidData, "No space in Buffer"));
+                Err(err) => {
+                    return Err(err);
+                }
             }
         }
     }
