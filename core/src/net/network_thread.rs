@@ -32,6 +32,7 @@ use std::{
     usize,
 };
 use uuid::Uuid;
+use crate::messaging::SerialisedFrame;
 
 // Used for identifying connections
 const TCP_SERVER: Token = Token(0);
@@ -375,7 +376,33 @@ impl NetworkThread {
         }
     }
 
-    fn handle_writeable_event(&mut self, event: &EventWithRetries) -> () {}
+    fn handle_writeable_event(&mut self, event: &EventWithRetries) -> () {
+
+    }
+
+
+    fn try_write(&mut self, address: &SocketAddr) {
+        if let Some(mut channel) = self.channel_map.remove(address) {
+            match channel.try_drain() {
+                Err(ref err) if broken_pipe(err) => {
+                    // Remove the channel
+                    drop(channel);
+                    self.lost_connection(address);
+                    return;
+                }
+                Ok(n) => {
+                    self.sent_bytes += n as u64;
+                    if let ChannelState::CloseReceived(addr, id) = channel.state {
+                        channel.state = ChannelState::Closed(addr, id);
+                        // TODO:
+                    }
+                }
+                Err(e) => {
+                    error!(self.log, "Unhandled error while writing to {}\n{:?}", address, e);
+                }
+            }
+        }
+    }
 
     fn retry_event(&mut self, event: &EventWithRetries) -> () {
         if event.retries <= self.network_config.get_max_connection_retry_attempts() {
@@ -502,32 +529,6 @@ impl NetworkThread {
         ));
     }
 
-    /*
-    fn try_write(&mut self, addr: &SocketAddr) -> IoReturn {
-        if let Some(channel) = self.channel_map.get_mut(&addr) {
-            match channel.try_drain() {
-                Err(ref err) if broken_pipe(err) => {
-                    return IoReturn::LostConnection;
-                }
-                Ok(n) => {
-                    self.sent_bytes += n as u64;
-                    if let ChannelState::CloseReceived(addr, id) = channel.state {
-                        channel.state = ChannelState::Closed(addr, id);
-                        return IoReturn::CloseConnection;
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        self.log,
-                        "Unhandled error while writing to {}\n{:?}", addr, e
-                    );
-                }
-            }
-        }
-        IoReturn::None
-    }
-    */
-
     fn request_stream(&mut self, addr: SocketAddr) {
         // Make sure we never request request a stream to someone we already have a connection to
         // Async communication with the dispatcher can lead to this
@@ -637,105 +638,87 @@ impl NetworkThread {
 
     fn receive_dispatch(&mut self) {
         while let Ok(event) = self.input_queue.try_recv() {
-            match event {
-                DispatchEvent::SendTcp(addr, data) => {
-                    self.sent_msgs += 1;
-                    // Get the token corresponding to the connection
-                    if let Some(channel) = self.channel_map.get_mut(&addr) {
-                        // The stream is already set-up, buffer the package and wait for writable event
-                        if channel.connected() {
-                            match data {
-                                DispatchData::Serialised(frame) => {
-                                    channel.enqueue_serialised(frame);
-                                }
-                                _ => {
-                                    if let Err(e) = self
-                                        .encode_buffer
-                                        .get_buffer_encoder()
-                                        .and_then(|mut buf| {
-                                            channel.enqueue_serialised(
-                                                data.into_serialised(&mut buf)?,
-                                            );
-                                            Ok(())
-                                        })
-                                    {
-                                        warn!(self.log, "Error serialising message: {}", e);
-                                    }
-                                }
-                            }
-                        } else {
-                            debug!(self.log, "Dispatch trying to route to non connected channel {:?}, rejecting the message", channel);
-                            self.reject_dispatch_data(addr, data);
-                            break;
-                        }
-                    } else {
-                        // The stream isn't set-up, request connection, set-it up and try to send the message
-                        debug!(self.log, "Dispatch trying to route to unrecognized address {}, rejecting the message", addr);
-                        self.reject_dispatch_data(addr, data);
-                        break;
-                    }
-                    /*
-                    if let IoReturn::LostConnection = self.try_write(&addr) {
-                        self.lost_connection(addr);
-                    }
-                    */
+            self.handle_dispatch_event(event);
+        }
+    }
+
+    fn handle_dispatch_event(&mut self, event: DispatchEvent) {
+        match event {
+            DispatchEvent::SendTcp(address, data) => {
+                self.send_tcp_message(address, data);
+            }
+            DispatchEvent::SendUdp(address, data) => {
+                self.send_udp_message(address, data);
+            }
+            DispatchEvent::Stop => {
+                self.stop();
+            }
+            DispatchEvent::Kill => {
+                self.kill();
+            }
+            DispatchEvent::Connect(addr) => {
+                debug!(self.log, "Got DispatchEvent::Connect({})", addr);
+                self.request_stream(addr);
+            }
+            DispatchEvent::ClosedAck(addr) => {
+                debug!(self.log, "Got DispatchEvent::ClosedAck({})", addr);
+                self.handle_closed_ack(addr);
+            }
+            DispatchEvent::Close(addr) => {
+                self.close_connection(addr);
+            }
+        }
+    }
+
+    fn send_tcp_message(&mut self, address: SocketAddr, data: DispatchData) {
+        if let Some(channel) = self.channel_map.get_mut(&address) {
+            // The stream is already set-up, buffer the package and wait for writable event
+            if channel.connected() {
+                if let Ok(frame) = self.serialise_dispatch_data(data) {
+                    channel.enqueue_serialised(frame);
+                    channel.try_drain();
+                } else {
+                    // TODO: Out of Buffers for Lazy-serialisation?
                 }
-                DispatchEvent::SendUdp(addr, data) => {
-                    self.sent_msgs += 1;
-                    // Get the token corresponding to the connection
-                    if let Some(ref mut udp_state) = self.udp_state {
-                        match data {
-                            DispatchData::Serialised(frame) => {
-                                udp_state.enqueue_serialised(addr, frame);
-                            }
-                            _ => {
-                                if let Err(e) =
-                                    self.encode_buffer.get_buffer_encoder().and_then(|mut buf| {
-                                        udp_state.enqueue_serialised(
-                                            addr,
-                                            data.into_serialised(&mut buf)?,
-                                        );
-                                        Ok(())
-                                    })
-                                {
-                                    warn!(self.log, "Error serialising message: {}", e);
-                                }
-                            }
-                        }
-                        match udp_state.try_write() {
-                            Ok(n) => {
-                                self.sent_bytes += n as u64;
-                            }
-                            Err(e) => {
-                                warn!(self.log, "Error during UDP sending: {}", e);
-                                debug!(self.log, "UDP erro debug info: {:?}", e);
-                            }
-                        }
-                    } else {
-                        self.reject_dispatch_data(addr, data);
-                        warn!(
-                            self.log,
-                            "Rejecting UDP message to {} as socket is already shut down.", addr
-                        );
+            } else {
+                trace!(self.log, "Dispatch trying to route to non connected channel {:?}, rejecting the message", channel);
+                self.reject_dispatch_data(address, data);
+            }
+        } else {
+            trace!(self.log, "Dispatch trying to route to unrecognized address {}, rejecting the message", address);
+            self.reject_dispatch_data(address, data);
+        }
+    }
+
+    fn send_udp_message(&mut self, address: SocketAddr, data: DispatchData) {
+        if let Some(ref mut udp_state) = self.udp_state {
+            if let Ok(frame) = self.serialise_dispatch_data(data) {
+                udp_state.enqueue_serialised(address, frame);
+                match udp_state.try_write() {
+                    Ok(n) => {
+                        self.sent_bytes += n as u64;
+                    }
+                    Err(e) => {
+                        warn!(self.log, "Error during UDP sending: {}", e);
+                        debug!(self.log, "UDP erro debug info: {:?}", e);
                     }
                 }
-                DispatchEvent::Stop => {
-                    self.stop();
-                }
-                DispatchEvent::Kill => {
-                    self.kill();
-                }
-                DispatchEvent::Connect(addr) => {
-                    debug!(self.log, "Got DispatchEvent::Connect({})", addr);
-                    self.request_stream(addr);
-                }
-                DispatchEvent::ClosedAck(addr) => {
-                    debug!(self.log, "Got DispatchEvent::ClosedAck({})", addr);
-                    self.handle_closed_ack(addr);
-                }
-                DispatchEvent::Close(addr) => {
-                    self.close_connection(addr);
-                }
+            } else {
+                // TODO: Out of Buffers for Lazy-serialisation?
+            }
+        } else {
+            self.reject_dispatch_data(address, data);
+            trace!(self.log, "Rejecting UDP message to {} as socket is already shut down.", address);
+        }
+    }
+
+    fn serialise_dispatch_data(&mut self, data: DispatchData) -> Result<SerialisedFrame, SerError> {
+        match data {
+            DispatchData::Serialised(frame) => {
+                Ok(frame)
+            }
+            _ => {
+                data.into_serialised(&mut self.encode_buffer.get_buffer_encoder()?)
             }
         }
     }
