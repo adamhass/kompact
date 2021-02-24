@@ -4,7 +4,7 @@ use crate::{
         lookup::{ActorLookup, LookupResult},
         NetworkConfig,
     },
-    messaging::{DispatchEnvelope, EventEnvelope},
+    messaging::{DispatchEnvelope, EventEnvelope, SerialisedFrame},
     net::{
         buffers::{BufferChunk, BufferPool, EncodeBuffer},
         network_channel::{ChannelState, TcpChannel},
@@ -25,14 +25,13 @@ use serialisation::ser_helpers::deserialise_chunk_lease;
 use std::{
     collections::VecDeque,
     io,
-    io::{Error, ErrorKind},
     net::{Shutdown, SocketAddr},
     sync::Arc,
     time::Duration,
     usize,
 };
 use uuid::Uuid;
-use crate::messaging::SerialisedFrame;
+use crate::net::ConnectionState::Connected;
 
 // Used for identifying connections
 const TCP_SERVER: Token = Token(0);
@@ -88,6 +87,15 @@ impl EventWithRetries {
         }
     }
 
+    fn writeable_with_token(token: &Token) -> EventWithRetries {
+        EventWithRetries {
+            token: token.clone(),
+            readable: false,
+            writeable: true,
+            retries: 0,
+        }
+    }
+
     fn get_retry_event(&self) -> EventWithRetries {
         EventWithRetries {
             token: self.token,
@@ -127,12 +135,11 @@ impl NetworkThread {
                 // Set up polling for the Dispatcher and the listener.
                 let poll = Poll::new().expect("failed to create Poll instance in NetworkThread");
 
-                // Register Listener
-                let registry = poll.registry();
-                registry
+                // Register Listeners
+                poll.registry()
                     .register(&mut tcp_listener, TCP_SERVER, Interest::READABLE)
                     .expect("failed to register TCP SERVER");
-                registry
+                poll.registry()
                     .register(
                         &mut udp_socket,
                         UDP_SOCKET,
@@ -325,83 +332,99 @@ impl NetworkThread {
             }
             _ => {
                 if event.writeable {
-                    self.handle_writeable_event(&event);
+                    if let Some(channel) = self.take_channel_by_token(&event.token) {
+                        self.handle_writeable_event(&event, channel);
+                    } else {
+                        trace!(self.log, "No channel for event with token {}", &event.token.0);
+                    }
                 }
                 if event.readable {
-                    self.handle_readable_event(&event);
-                }
-            }
-        }
-    }
-
-    fn handle_readable_event(&mut self, event: &EventWithRetries) {
-        if let Some(addr) = self.token_map.get(&event.token) {
-            if let Some(mut channel) = self.channel_map.remove(&addr) {
-                loop {
-                    match channel.read_frame(&mut self.buffer_pool) {
-                        Ok(None) => {
-                            self.channel_map.insert(*addr, channel);
-                            return;
-                        }
-                        Ok(Some(Frame::Data(data))) => {
-                            self.handle_data_frame(data);
-                        }
-                        Ok(Some(Frame::Start(start))) => {
-                            self.handle_start(event, channel, &start);
-                            return;
-                        }
-                        Ok(Some(Frame::Bye())) => {
-                            self.handle_bye(&mut channel);
-                            self.channel_map.insert(*addr, channel);
-                            return;
-                        }
-                        Err(e) if no_buffer_space(&e) => {
-                            self.out_of_buffers = true;
-                            trace!(self.log, "Out of Buffers");
-                            self.channel_map.insert(addr.clone(), channel);
-                            self.retry_event(event);
-                            return;
-                        }
-                        Err(e) => {
-                            error!(self.log, "Error reading from channel {}: {}", &addr, &e);
-                            self.channel_map.insert(*addr, channel);
-                            return;
-                        }
-                        Ok(Some(frame)) => {
-                            error!(self.log, "Unrecognized frame type {:?}", &frame);
-                        }
+                    if let Some(channel) = self.take_channel_by_token(&event.token) {
+                        self.handle_readable_event(&event, channel);
+                    } else {
+                        trace!(self.log, "No channel for event with token {}", &event.token.0);
                     }
                 }
             }
         }
     }
 
-    fn handle_writeable_event(&mut self, event: &EventWithRetries) -> () {
-
+    fn take_channel_by_token(&mut self, token: &Token) -> Option<TcpChannel> {
+        if let Some(address) = self.token_map.get(token) {
+            self.take_channel_by_address(address.clone())
+        } else { None }
     }
 
+    fn take_channel_by_address(&mut self, address: SocketAddr) -> Option<TcpChannel> {
+        self.channel_map.remove(&address)
+    }
 
-    fn try_write(&mut self, address: &SocketAddr) {
-        if let Some(mut channel) = self.channel_map.remove(address) {
-            match channel.try_drain() {
-                Err(ref err) if broken_pipe(err) => {
-                    // Remove the channel
-                    drop(channel);
-                    self.lost_connection(address);
+    fn handle_readable_event(&mut self, event: &EventWithRetries, mut channel: TcpChannel) {
+        loop {
+            match channel.read_frame(&mut self.buffer_pool) {
+                Ok(None) => {
+                    self.channel_map.insert(channel.address(), channel);
                     return;
                 }
-                Ok(n) => {
-                    self.sent_bytes += n as u64;
-                    if let ChannelState::CloseReceived(addr, id) = channel.state {
-                        channel.state = ChannelState::Closed(addr, id);
-                        // TODO:
-                    }
+                Ok(Some(Frame::Data(data))) => {
+                    self.handle_data_frame(data);
+                }
+                Ok(Some(Frame::Start(start))) => {
+                    self.handle_start(event, channel, &start);
+                    return;
+                }
+                Ok(Some(Frame::Ack())) => {
+                    self.notify_connection_state(channel.address(), Connected)
+                }
+                Ok(Some(Frame::Bye())) => {
+                    self.handle_bye(&mut channel);
+                    self.channel_map.insert(channel.address(), channel);
+                    return;
+                }
+                Err(e) if no_buffer_space(&e) => {
+                    self.out_of_buffers = true;
+                    trace!(self.log, "Out of Buffers");
+                    self.channel_map.insert(channel.address(), channel);
+                    self.retry_event(event);
+                    return;
                 }
                 Err(e) => {
-                    error!(self.log, "Unhandled error while writing to {}\n{:?}", address, e);
+                    error!(self.log, "Error reading from channel {}: {}", channel.address(), &e);
+                    self.channel_map.insert(channel.address(), channel);
+                    return;
+                }
+                Ok(Some(frame)) => {
+                    error!(self.log, "Unrecognized frame type {:?}", &frame);
                 }
             }
         }
+    }
+
+    fn handle_writeable_event(&mut self, event: &EventWithRetries, mut channel: TcpChannel) -> () {
+        match channel.try_drain() {
+            Err(ref err) if broken_pipe(err) => {
+                self.lost_connection(&channel.address());
+                return;
+            }
+            Ok(n) => {
+                self.sent_bytes += n as u64;
+                if let ChannelState::CloseReceived(addr, id) = channel.state {
+                    channel.state = ChannelState::Closed(addr, id);
+                    debug!(
+                        self.log,
+                        "Connection shutdown gracefully, awaiting dispatcher Ack"
+                    );
+                    self.notify_connection_state(channel.address(), ConnectionState::Closed);
+                }
+            }
+            Err(e) => {
+                error!(
+                    self.log,
+                    "Unhandled error while writing to {}\n{:?}", channel.address(), e
+                );
+            }
+        }
+        self.channel_map.insert(channel.address(), channel);
     }
 
     fn retry_event(&mut self, event: &EventWithRetries) -> () {
@@ -454,7 +477,7 @@ impl NetworkThread {
     ///     The connection has already started, in which case this channel must be killed.
     ///     The connection has a known UUID but is not connected: Use the UUID as a tie breaker for which to kill and which to keep.
     fn handle_start(&mut self, event: &EventWithRetries, mut channel: TcpChannel, start: &Start) {
-        if let Some(mut other_channel) = self.channel_map.remove(&start.addr) {
+        if let Some(other_channel) = self.channel_map.remove(&start.addr) {
             debug!(
                 self.log,
                 "Merging channels for remote system {}", &start.addr
@@ -494,14 +517,6 @@ impl NetworkThread {
         let _ = channel.shutdown();
     }
 
-    fn handle_ack(&mut self, addr: &SocketAddr) -> () {
-        if let Some(channel) = self.channel_map.get_mut(addr) {
-            debug!(self.log, "Handling ack for {}", addr);
-            channel.handle_ack();
-            self.notify_connection_state(*addr, ConnectionState::Connected);
-        }
-    }
-
     fn handle_bye(&self, channel: &mut TcpChannel) -> () {
         debug!(self.log, "Handling Bye for {:?}", &channel);
         if channel.handle_bye().is_ok() {
@@ -510,7 +525,7 @@ impl NetworkThread {
                 "Connection shutdown gracefully, awaiting dispatcher Ack"
             );
             self.notify_connection_state(
-                channel.get_address().expect("must have address"),
+                channel.address(),
                 ConnectionState::Closed,
             );
         }
@@ -524,15 +539,16 @@ impl NetworkThread {
     }
 
     fn reject_dispatch_data(&self, address: SocketAddr, data: DispatchData) {
-        self.dispatcher_ref.tell(DispatchEnvelope::Event(
-            EventEnvelope::Network(NetworkEvent::RejectedData(address, data)),
-        ));
+        self.dispatcher_ref
+            .tell(DispatchEnvelope::Event(EventEnvelope::Network(
+                NetworkEvent::RejectedData(address, data),
+            )));
     }
 
-    fn request_stream(&mut self, addr: SocketAddr) {
+    fn request_stream(&mut self, address: SocketAddr) {
         // Make sure we never request request a stream to someone we already have a connection to
         // Async communication with the dispatcher can lead to this
-        if let Some(channel) = self.channel_map.remove(&addr) {
+        if let Some(channel) = self.take_channel_by_address(address) {
             // We already have a connection set-up
             // the connection request must have been sent before the channel was initialized
             match channel.state {
@@ -540,10 +556,10 @@ impl NetworkThread {
                     // log and inform Dispatcher to make sure it knows we're connected.
                     debug!(
                         self.log,
-                        "Asked to request connection to already connected host {}", &addr
+                        "Asked to request connection to already connected host {}", &address
                     );
-                    self.notify_connection_state(addr, ConnectionState::Connected);
-                    self.channel_map.insert(addr, channel);
+                    self.notify_connection_state(address, ConnectionState::Connected);
+                    self.channel_map.insert(address, channel);
                     return;
                 }
                 ChannelState::Closed(_, _) => {
@@ -551,9 +567,9 @@ impl NetworkThread {
                     // This shouldn't happen but the system will likely recover from it eventually
                     debug!(
                         self.log,
-                        "Requested connection to host before receiving ClosedAck {}", &addr
+                        "Requested connection to host before receiving ClosedAck {}", &address
                     );
-                    self.channel_map.insert(addr, channel);
+                    self.channel_map.insert(address, channel);
                     return;
                 }
                 _ => {
@@ -564,13 +580,13 @@ impl NetworkThread {
         }
         // Fetch a buffer before we make the request
         if let Some(buffer) = self.buffer_pool.get_buffer() {
-            debug!(self.log, "Requesting connection to {}", &addr);
-            match TcpStream::connect(addr) {
+            debug!(self.log, "Requesting connection to {}", &address);
+            match TcpStream::connect(address) {
                 Ok(stream) => {
                     self.store_stream(
                         stream,
-                        &addr,
-                        ChannelState::Requested(addr, Uuid::new_v4()),
+                        address,
+                        ChannelState::Requested(address, Uuid::new_v4()),
                         buffer,
                     );
                 }
@@ -578,7 +594,7 @@ impl NetworkThread {
                     //  Connection will be re-requested
                     error!(
                         self.log,
-                        "Failed to connect to remote host {}, error: {:?}", &addr, e
+                        "Failed to connect to remote host {}, error: {:?}", &address, e
                     );
                 }
             }
@@ -587,17 +603,17 @@ impl NetworkThread {
             trace!(
                 self.log,
                 "No Buffers available when attempting to connect to remote host {}",
-                &addr
+                &address
             );
         }
     }
 
     #[allow(irrefutable_let_patterns)]
     fn receive_stream(&mut self) -> io::Result<()> {
-        while let (stream, addr) = (self.tcp_listener.as_ref().unwrap()).accept()? {
+        while let (stream, address) = (self.tcp_listener.as_ref().unwrap()).accept()? {
             if let Some(buffer) = self.buffer_pool.get_buffer() {
-                debug!(self.log, "Accepting connection from {}", &addr);
-                self.store_stream(stream, &addr, ChannelState::Initialising, buffer);
+                debug!(self.log, "Accepting connection from {}", &address);
+                self.store_stream(stream, address, ChannelState::Initialising, buffer);
             } else {
                 // If we can't get a buffer we reject the channel immediately
                 stream.shutdown(Shutdown::Both)?;
@@ -609,20 +625,21 @@ impl NetworkThread {
     fn store_stream(
         &mut self,
         stream: TcpStream,
-        addr: &SocketAddr,
+        address: SocketAddr,
         state: ChannelState,
         buffer: BufferChunk,
     ) {
-        self.token_map.insert(self.token, *addr);
+        self.token_map.insert(self.token, address.clone());
         let mut channel = TcpChannel::new(
             stream,
             self.token,
+            address,
             buffer,
             state,
             self.addr,
             &self.network_config,
         );
-        debug!(self.log, "Saying Hello to {}", addr);
+        debug!(self.log, "Saying Hello to {}", address);
         // Whatever error is thrown here will be re-triggered and handled later.
         channel.initialise(&self.addr);
         if let Err(e) = self.poll.registry().register(
@@ -630,9 +647,9 @@ impl NetworkThread {
             self.token,
             Interest::READABLE | Interest::WRITABLE,
         ) {
-            error!(self.log, "Failed to register polling for {}\n{:?}", addr, e);
+            error!(self.log, "Failed to register polling for {}\n{:?}", address, e);
         }
-        self.channel_map.insert(*addr, channel);
+        self.channel_map.insert(channel.address(), channel);
         self.next_token();
     }
 
@@ -671,27 +688,36 @@ impl NetworkThread {
     }
 
     fn send_tcp_message(&mut self, address: SocketAddr, data: DispatchData) {
-        if let Some(channel) = self.channel_map.get_mut(&address) {
+        if let Some(mut channel) = self.channel_map.remove(&address) {
             // The stream is already set-up, buffer the package and wait for writable event
             if channel.connected() {
                 if let Ok(frame) = self.serialise_dispatch_data(data) {
                     channel.enqueue_serialised(frame);
-                    channel.try_drain();
+                    self.retry_queue.push_back(EventWithRetries::writeable_with_token(&channel.token));
                 } else {
                     // TODO: Out of Buffers for Lazy-serialisation?
                 }
             } else {
-                trace!(self.log, "Dispatch trying to route to non connected channel {:?}, rejecting the message", channel);
+                trace!(
+                    self.log,
+                    "Dispatch trying to route to non connected channel {:?}, rejecting the message",
+                    channel
+                );
                 self.reject_dispatch_data(address, data);
             }
+            self.channel_map.insert(address, channel);
         } else {
-            trace!(self.log, "Dispatch trying to route to unrecognized address {}, rejecting the message", address);
+            trace!(
+                self.log,
+                "Dispatch trying to route to unrecognized address {}, rejecting the message",
+                address
+            );
             self.reject_dispatch_data(address, data);
         }
     }
 
     fn send_udp_message(&mut self, address: SocketAddr, data: DispatchData) {
-        if let Some(ref mut udp_state) = self.udp_state {
+        if let Some(mut udp_state) = self.udp_state.take() {
             if let Ok(frame) = self.serialise_dispatch_data(data) {
                 udp_state.enqueue_serialised(address, frame);
                 match udp_state.try_write() {
@@ -706,32 +732,34 @@ impl NetworkThread {
             } else {
                 // TODO: Out of Buffers for Lazy-serialisation?
             }
+            self.udp_state = Some(udp_state);
         } else {
             self.reject_dispatch_data(address, data);
-            trace!(self.log, "Rejecting UDP message to {} as socket is already shut down.", address);
+            trace!(
+                self.log,
+                "Rejecting UDP message to {} as socket is already shut down.",
+                address
+            );
         }
     }
 
     fn serialise_dispatch_data(&mut self, data: DispatchData) -> Result<SerialisedFrame, SerError> {
         match data {
-            DispatchData::Serialised(frame) => {
-                Ok(frame)
-            }
-            _ => {
-                data.into_serialised(&mut self.encode_buffer.get_buffer_encoder()?)
-            }
+            DispatchData::Serialised(frame) => Ok(frame),
+            _ => data.into_serialised(&mut self.encode_buffer.get_buffer_encoder()?),
         }
     }
 
     /// Handles all logic necessary to shutdown a channel for which the connection has been lost.
     fn lost_connection(&mut self, addr: &SocketAddr) -> () {
-        // We will only drop the Channel once we get the CloseAck from the NetworkDispatcher
+        // Only drop the Channel when we get the CloseAck from the NetworkDispatcher
+        trace!(self.log, "Lost connection to address {}", addr);
+        self.notify_connection_state(*addr, ConnectionState::Lost);
         if let Some(channel) = self.channel_map.get_mut(&addr) {
-            self.notify_connection_state(*addr, ConnectionState::Lost);
+            channel.shutdown();
             for rejected_frame in channel.take_outbound() {
                 self.reject_dispatch_data(*addr, DispatchData::Serialised(rejected_frame));
             }
-            channel.shutdown();
         }
     }
 
@@ -844,7 +872,7 @@ mod tests {
             .poll
             .poll(&mut events, Some(Duration::from_millis(100)));
         for event in events.iter() {
-            thread.handle_event(event.token(), event.is_readable(), event.is_writable(), 0);
+            thread.handle_event(EventWithRetries::from(event));
         }
     }
 

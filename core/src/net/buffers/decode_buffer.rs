@@ -182,9 +182,6 @@ impl DecodeBuffer {
                     FrameType::Start => {
                         Start::decode_from(chunk_lease).map_err(|_| FramingError::InvalidFrame)
                     }
-                    FrameType::Ack => {
-                        Ack::decode_from(chunk_lease).map_err(|_| FramingError::InvalidFrame)
-                    }
                     _ => Err(FramingError::UnsupportedFrameType),
                 }
             } else {
@@ -197,6 +194,7 @@ impl DecodeBuffer {
                 match head.frame_type() {
                     // Frames without content match here for expediency, Decoder doesn't allow 0 length.
                     FrameType::Bye => Ok(Frame::Bye()),
+                    FrameType::Ack => Ok(Frame::Ack()),
                     _ => Err(FramingError::NoData),
                 }
             } else {

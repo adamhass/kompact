@@ -3,7 +3,7 @@ use crate::{
     messaging::SerialisedFrame,
     net::{
         buffers::{BufferChunk, BufferPool, DecodeBuffer},
-        frames::{Ack, Frame, FramingError, Hello, Start, FRAME_HEAD_LEN},
+        frames::{Frame, FramingError, Hello, Start, FRAME_HEAD_LEN},
     },
 };
 use bytes::{Buf, BytesMut};
@@ -56,6 +56,7 @@ pub(crate) struct TcpChannel {
     stream: TcpStream,
     outbound_queue: VecDeque<SerialisedFrame>,
     pub token: Token,
+    address: SocketAddr,
     input_buffer: DecodeBuffer,
     pub state: ChannelState,
     pub messages: u32,
@@ -67,6 +68,7 @@ impl TcpChannel {
     pub fn new(
         stream: TcpStream,
         token: Token,
+        address: SocketAddr,
         buffer_chunk: BufferChunk,
         state: ChannelState,
         own_addr: SocketAddr,
@@ -77,6 +79,7 @@ impl TcpChannel {
             stream,
             outbound_queue: VecDeque::new(),
             token,
+            address,
             input_buffer,
             state,
             messages: 0,
@@ -138,6 +141,7 @@ impl TcpChannel {
             let start = Frame::Start(Start::new(self.own_addr, id));
             self.send_frame(start);
             self.state = ChannelState::Initialised(hello.addr, id);
+            self.address = hello.addr;
         }
     }
 
@@ -146,17 +150,18 @@ impl TcpChannel {
     pub fn handle_start(&mut self, start: &Start) -> () {
         if let ChannelState::Initialising = self.state {
             // Method called because we received Start and want to send Ack.
-            let ack = Frame::Ack(Ack { offset: 0 }); // we don't use offsets yet.
+            let ack = Frame::Ack();
             self.stream
                 .set_nodelay(self.nodelay)
                 .expect("set nodelay failed");
             self.send_frame(ack);
             self.state = ChannelState::Connected(start.addr, start.id);
+            self.address = start.addr;
         }
     }
 
-    pub fn get_address(&self) -> Option<SocketAddr> {
-        self.state.get_address()
+    pub fn address(&self) -> SocketAddr {
+        self.address
     }
 
     /// Returns true if it transitioned, false if it's not starting.
@@ -215,10 +220,10 @@ impl TcpChannel {
                 self.handle_hello(hello);
                 self.read_frame(buffer_pool)
             }
-            Ok(Frame::Ack(_)) => {
+            Ok(Frame::Ack()) => {
                 // Handle the Ack internally then continue decoding
                 self.handle_ack();
-                self.read_frame(buffer_pool)
+                Ok(Some(Frame::Ack()))
             }
             Ok(Frame::Bye()) => {
                 self.handle_bye();
@@ -324,14 +329,13 @@ impl TcpChannel {
 
     /// Returns `true` if this channel was not in [ChannelState::Connected](ChannelState::Connected)
     /// `true` means that it can safely be dropped.
-    pub fn shutdown(&mut self) -> bool {
+    pub fn shutdown(&mut self) -> () {
         let _ = self.stream.shutdown(Both); // Discard errors while closing channels for now...
         match self.state {
             ChannelState::Connected(addr, id) => {
                 self.state = ChannelState::Closed(addr, id);
-                false
             }
-            _ => true,
+            _ => (),
         }
     }
 

@@ -54,7 +54,7 @@ pub enum Frame {
     /// Start, used to initiate network channels
     Start(Start),
     /// Ack to acknowledge that the connection is started.
-    Ack(Ack),
+    Ack(),
     /// Bye to signal that a channel is closing.
     Bye(),
 }
@@ -66,7 +66,7 @@ impl Frame {
             Frame::Data(_) => FrameType::Data,
             Frame::Hello(_) => FrameType::Hello,
             Frame::Start(_) => FrameType::Start,
-            Frame::Ack(_) => FrameType::Ack,
+            Frame::Ack() => FrameType::Ack,
             Frame::Bye() => FrameType::Bye,
         }
     }
@@ -79,7 +79,7 @@ impl Frame {
             Frame::Data(frame) => frame.encode_into(dst),
             Frame::Hello(frame) => frame.encode_into(dst),
             Frame::Start(frame) => frame.encode_into(dst),
-            Frame::Ack(frame) => frame.encode_into(dst),
+            Frame::Ack() => Ok(()),
             Frame::Bye() => Ok(()),
         }
     }
@@ -90,7 +90,6 @@ impl Frame {
             Frame::Data(ref frame) => frame.encoded_len(),
             Frame::Hello(ref frame) => frame.encoded_len(),
             Frame::Start(ref frame) => frame.encoded_len(),
-            Frame::Ack(ref frame) => frame.encoded_len(),
             _ => 0,
         }
     }
@@ -138,13 +137,6 @@ pub struct Start {
     pub addr: SocketAddr,
     /// "Channel ID", used as a tie-breaker in mutual connection requests
     pub id: Uuid,
-}
-
-/// Hello, used to initiate network channels
-#[derive(Debug)]
-pub struct Ack {
-    /// Ack where we're ready to start receiving from.
-    pub offset: u128,
 }
 
 /// Byte-mappings for frame types
@@ -402,22 +394,5 @@ impl FrameExt for Start {
                 1 + 16 + 2 + 16 // version + ip + port + uuid
             }
         }
-    }
-}
-
-impl FrameExt for Ack {
-    fn decode_from(mut src: ChunkLease) -> Result<Frame, FramingError> {
-        Ok(Frame::Ack(Ack {
-            offset: src.get_u128(),
-        }))
-    }
-
-    fn encode_into<B: BufMut>(&mut self, dst: &mut B) -> Result<(), FramingError> {
-        dst.put_u128(self.offset);
-        Ok(())
-    }
-
-    fn encoded_len(&self) -> usize {
-        16
     }
 }
