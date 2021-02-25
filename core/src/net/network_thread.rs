@@ -350,9 +350,14 @@ impl NetworkThread {
     }
 
     fn take_channel_by_token(&mut self, token: &Token) -> Option<TcpChannel> {
-        if let Some(address) = self.token_map.get(token) {
-            self.take_channel_by_address(address.clone())
-        } else { None }
+        // Ugly way of escaping double borrow...
+        let address_opt = if let Some(address) = self.token_map.get(token) {
+            Some(address.clone())
+        } else { None };
+        if let Some(address) = address_opt {
+            return self.take_channel_by_address(address)
+        }
+        None
     }
 
     fn take_channel_by_address(&mut self, address: SocketAddr) -> Option<TcpChannel> {
@@ -360,13 +365,16 @@ impl NetworkThread {
     }
 
     fn handle_readable_event(&mut self, event: &EventWithRetries, mut channel: TcpChannel) {
+        info!(self.log, "readable event");
         loop {
             match channel.read_frame(&mut self.buffer_pool) {
                 Ok(None) => {
+                    info!(self.log, "read none");
                     self.channel_map.insert(channel.address(), channel);
                     return;
                 }
                 Ok(Some(Frame::Data(data))) => {
+                    info!(self.log, "read data frame");
                     self.handle_data_frame(data);
                 }
                 Ok(Some(Frame::Start(start))) => {
@@ -386,6 +394,13 @@ impl NetworkThread {
                     trace!(self.log, "Out of Buffers");
                     self.channel_map.insert(channel.address(), channel);
                     self.retry_event(event);
+                    return;
+                }
+                Err(e) if connection_reset(&e) => {
+                    trace!(self.log, "Connection lost, reset by peer {}", channel.address());
+                    let address = channel.address();
+                    self.channel_map.insert(channel.address(), channel);
+                    self.lost_connection(&address);
                     return;
                 }
                 Err(e) => {
@@ -692,6 +707,7 @@ impl NetworkThread {
             // The stream is already set-up, buffer the package and wait for writable event
             if channel.connected() {
                 if let Ok(frame) = self.serialise_dispatch_data(data) {
+                    info!(self.log, "enqueued frame");
                     channel.enqueue_serialised(frame);
                     self.retry_queue.push_back(EventWithRetries::writeable_with_token(&channel.token));
                 } else {

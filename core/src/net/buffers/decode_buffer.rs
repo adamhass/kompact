@@ -83,13 +83,12 @@ impl DecodeBuffer {
     }
 
     /// Returns true if there is data to be decoded, else false
-    pub(crate) fn can_decode(&self) -> bool {
+    pub(crate) fn can_decode(&mut self) -> bool {
+        self.decode_frame_head();
         if let Some(head) = &self.next_frame_head {
             if self.readable_len() >= head.content_length() {
                 return true;
             }
-        } else if self.readable_len() >= FRAME_HEAD_LEN as usize {
-            return true;
         }
         false
     }
@@ -167,43 +166,41 @@ impl DecodeBuffer {
 
     /// Tries to decode one frame from the readable part of the buffer
     pub fn get_frame(&mut self) -> Result<Frame, FramingError> {
+        self.decode_frame_head();
         if let Some(head) = &self.next_frame_head {
             if self.readable_len() >= head.content_length() {
                 let head = self.next_frame_head.take().unwrap();
-                let chunk_lease = self.read_chunk_lease(head.content_length());
-                match head.frame_type() {
+                return match head.frame_type() {
                     // Frames with empty bodies should be handled in frame-head decoding below.
                     FrameType::Data => {
-                        Data::decode_from(chunk_lease).map_err(|_| FramingError::InvalidFrame)
+                        Data::decode_from(self.read_chunk_lease(head.content_length()))
+                            .map_err(|_| FramingError::InvalidFrame)
                     }
                     FrameType::Hello => {
-                        Hello::decode_from(chunk_lease).map_err(|_| FramingError::InvalidFrame)
+                        Hello::decode_from(self.read_chunk_lease(head.content_length()))
+                            .map_err(|_| FramingError::InvalidFrame)
                     }
                     FrameType::Start => {
-                        Start::decode_from(chunk_lease).map_err(|_| FramingError::InvalidFrame)
+                        Start::decode_from(self.read_chunk_lease(head.content_length()))
+                            .map_err(|_| FramingError::InvalidFrame)
                     }
-                    _ => Err(FramingError::UnsupportedFrameType),
-                }
-            } else {
-                Err(FramingError::NoData)
-            }
-        } else if self.readable_len() >= FRAME_HEAD_LEN as usize {
-            let mut chunk_lease = self.read_chunk_lease(FRAME_HEAD_LEN as usize);
-            let head = FrameHead::decode_from(&mut chunk_lease)?;
-            if head.content_length() == 0 {
-                match head.frame_type() {
                     // Frames without content match here for expediency, Decoder doesn't allow 0 length.
                     FrameType::Bye => Ok(Frame::Bye()),
                     FrameType::Ack => Ok(Frame::Ack()),
-                    _ => Err(FramingError::NoData),
+                    _ => Err(FramingError::UnsupportedFrameType),
                 }
-            } else {
-                self.next_frame_head = Some(head);
-                self.get_frame()
             }
-        } else {
-            Err(FramingError::NoData)
         }
+        Err(FramingError::NoData)
+    }
+
+    fn decode_frame_head(&mut self) -> Result<(), FramingError> {
+        if self.next_frame_head.is_none() && self.readable_len() >= FRAME_HEAD_LEN as usize {
+            let mut chunk_lease = self.read_chunk_lease(FRAME_HEAD_LEN as usize);
+            let head = FrameHead::decode_from(&mut chunk_lease)?;
+            self.next_frame_head = Some(head);
+        }
+        Ok(())
     }
 
     /// Extracts the readable portion (if any) from the active buffer as a ChunkLease

@@ -198,13 +198,16 @@ impl TcpChannel {
         if !self.input_buffer.can_decode() {
             match self.receive() {
                 Ok(n) => {}
-                Err(err) if interrupted(&err) || would_block(&err) => {}
+                Err(err) if interrupted(&err) || would_block(&err) => {
+                    eprintln!("would block or interrupted");
+                }
                 Err(err) if no_buffer_space(&err) => {
                     // Only swap if everything in the current buffer has been decoded
                     if !&self.input_buffer.can_decode() {
                         let mut buffer_chunk = buffer_pool.get_buffer().ok_or(err)?;
                         self.swap_buffer(&mut buffer_chunk);
                         buffer_pool.return_buffer(buffer_chunk);
+                        return self.read_frame(buffer_pool)
                     }
                 }
                 Err(err) => {
@@ -213,8 +216,7 @@ impl TcpChannel {
                 }
             };
         }
-        let frame = self.decode();
-        match frame {
+        match self.decode() {
             Ok(Frame::Hello(hello)) => {
                 // Handle internally then continue reading
                 self.handle_hello(hello);
