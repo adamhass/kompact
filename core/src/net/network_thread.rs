@@ -32,6 +32,7 @@ use std::{
 };
 use uuid::Uuid;
 use crate::net::ConnectionState::Connected;
+use crate::prelude::NetMessage;
 
 // Used for identifying connections
 const TCP_SERVER: Token = Token(0);
@@ -240,6 +241,37 @@ impl NetworkThread {
         }
     }
 
+    fn write_udp(&mut self, udp_state: &mut UdpState) -> () {
+        match udp_state.try_write() {
+            Ok(n) => {
+                self.sent_bytes += n as u64;
+            }
+            Err(e) => {
+                warn!(self.log, "Error during UDP sending: {}", e);
+            }
+        }
+    }
+
+    fn read_udp(&mut self, udp_state: &mut UdpState, event: EventWithRetries) -> () {
+        match udp_state.try_read(&mut self.buffer_pool) {
+            Ok(_) => {}
+            Err(e) if no_buffer_space(&e) => {
+                trace!(
+                    self.log,
+                    "Could not get UDP buffer, retries: {}", event.retries
+                );
+                self.out_of_buffers = true;
+                self.retry_event(&event);
+            }
+            Err(e) => {
+                warn!(self.log, "Error during UDP reading: {}", e);
+            }
+        }
+        while let Some(net_message) = udp_state.incoming_messages.pop_front() {
+            self.deliver_net_message(net_message);
+        }
+    }
+
     fn handle_event(&mut self, event: EventWithRetries) {
         match event.token {
             TCP_SERVER => {
@@ -249,52 +281,16 @@ impl NetworkThread {
                 }
             }
             UDP_SOCKET => {
-                /*
-                if let Some(ref mut udp_state) = self.udp_state {
+                if let Some(mut udp_state) = self.udp_state.take() {
                     if event.writeable {
-                        match udp_state.try_write() {
-                            Ok(n) => {
-                                self.sent_bytes += n as u64;
-                            }
-                            Err(e) => {
-                                warn!(self.log, "Error during UDP sending: {}", e);
-                            }
-                        }
+                        self.write_udp(&mut udp_state);
                     }
                     if event.readable {
-                        match udp_state.try_read() {
-                            Ok((n, ioret)) => {
-                                if n > 0 {
-                                    self.received_bytes += n as u64;
-                                }
-                                if IoReturn::SwapBuffer == ioret {
-                                    if let Some(mut new_buffer) = self.buffer_pool.get_buffer() {
-                                        udp_state.swap_buffer(&mut new_buffer);
-                                        self.buffer_pool.return_buffer(new_buffer);
-                                        debug!(self.log, "Swapped UDP buffer");
-                                        self.out_of_buffers = false;
-                                        // We do not count successful swaps in the retries, stay at the same count
-                                        self.retry_queue
-                                            .push_back((token, readable, writeable, retries));
-                                    } else {
-                                        error!(
-                                            self.log,
-                                            "Could not get UDP buffer, retries: {}", retries
-                                        );
-                                        self.out_of_buffers = true;
-                                        self.retry_queue.push_back((
-                                            token,
-                                            readable,
-                                            writeable,
-                                            retries + 1,
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(self.log, "Error during UDP reading: {}", e);
-                            }
-                        }
+                        self.read_udp(&mut udp_state, event);
+                    }
+                    self.udp_state = Some(udp_state);
+                }
+                /*
                         use dispatch::lookup::{ActorLookup, LookupResult};
 
                         // Forward the data frame to the correct actor
@@ -455,9 +451,13 @@ impl NetworkThread {
     }
 
     fn handle_data_frame(&self, data: Data) -> () {
-        let lease_lookup = self.lookup.load();
         let buf = data.payload();
         let envelope = deserialise_chunk_lease(buf).expect("s11n errors");
+        self.deliver_net_message(envelope);
+    }
+
+    fn deliver_net_message(&self, envelope: NetMessage) -> () {
+        let lease_lookup = self.lookup.load();
         match lease_lookup.get_by_actor_path(&envelope.receiver) {
             LookupResult::Ref(actor) => {
                 actor.enqueue(envelope);
@@ -709,7 +709,7 @@ impl NetworkThread {
                 if let Ok(frame) = self.serialise_dispatch_data(data) {
                     info!(self.log, "enqueued frame");
                     channel.enqueue_serialised(frame);
-                    self.retry_queue.push_back(EventWithRetries::writeable_with_token(&channel.token));
+                    self.retry_event(&EventWithRetries::writeable_with_token(&channel.token));
                 } else {
                     // TODO: Out of Buffers for Lazy-serialisation?
                 }

@@ -6,6 +6,8 @@ use crate::{
 use mio::net::UdpSocket;
 use network_thread::*;
 use std::{cmp::min, collections::VecDeque, io, net::SocketAddr};
+use crate::net::buffers::BufferPool;
+use std::io::Error;
 
 // Note that this is a theoretical IPv4 limit.
 // This may be violated with IPv6 jumbograms.
@@ -79,32 +81,39 @@ impl UdpState {
         Ok(sent_bytes)
     }
 
-    /*
-    pub(super) fn try_read(&mut self) -> io::Result<(usize, IoReturn)> {
-        let mut received_bytes: usize = 0;
+    fn swap_buffer(&mut self, buffer_pool: &mut BufferPool) -> () {
+        if let Some(mut buffer) = buffer_pool.get_buffer() {
+            debug!(
+                self.logger,
+                "Swapping UDP buffer as only {} bytes remain.",
+                self.input_buffer.writeable_len()
+            );
+            self.input_buffer.swap_buffer(&mut buffer);
+            buffer_pool.return_buffer(buffer);
+        }
+    }
+
+    pub(super) fn try_read(&mut self, buffer_pool: &mut BufferPool) -> io::Result<()> {
         let mut interrupts = 0;
         loop {
-            if let Some(mut buf) = self.input_buffer.get_writeable() {
-                if buf.len() < self.max_packet_size {
-                    debug!(
-                        self.logger,
-                        "Swapping UDP buffer as only {} bytes remain.",
-                        buf.len()
-                    );
-                    return Ok((received_bytes, IoReturn::SwapBuffer));
+            if self.input_buffer.writeable_len() < self.max_packet_size {
+                self.swap_buffer(buffer_pool);
+                if self.input_buffer.writeable_len() < self.max_packet_size {
+                    return Err(Error::new(io::ErrorKind::InvalidInput, "Out of Buffers"));
                 }
+            }
+            if let Some(mut buf) = self.input_buffer.get_writeable() {
                 match self.socket.recv_from(&mut buf) {
                     Ok((0, addr)) => {
                         debug!(self.logger, "Got empty UDP datagram from {}", addr);
-                        return Ok((received_bytes, IoReturn::None));
+                        return Ok(());
                     }
                     Ok((n, addr)) => {
-                        received_bytes += n;
                         self.input_buffer.advance_writeable(n);
                         self.decode_message(addr);
                     }
                     Err(err) if would_block(&err) => {
-                        return Ok((received_bytes, IoReturn::None));
+                        return Ok(());
                     }
                     Err(err) if interrupted(&err) => {
                         // We should continue trying until no interruption
@@ -118,11 +127,10 @@ impl UdpState {
                     }
                 }
             } else {
-                return Ok((received_bytes, IoReturn::SwapBuffer));
+                return Err(Error::new(io::ErrorKind::InvalidInput, "Out of Buffers"));
             }
         }
     }
-     */
 
     fn decode_message(&mut self, source: SocketAddr) {
         match self.input_buffer.get_frame() {
@@ -156,9 +164,5 @@ impl UdpState {
 
     pub(super) fn enqueue_serialised(&mut self, addr: SocketAddr, frame: SerialisedFrame) -> () {
         self.outbound_queue.push_back((addr, frame));
-    }
-
-    pub(super) fn swap_buffer(&mut self, new_buffer: &mut BufferChunk) -> () {
-        self.input_buffer.swap_buffer(new_buffer);
     }
 }
