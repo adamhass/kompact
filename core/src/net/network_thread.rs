@@ -4,7 +4,7 @@ use crate::{
         lookup::{ActorLookup, LookupResult},
         NetworkConfig,
     },
-    messaging::{DispatchEnvelope, EventEnvelope, SerialisedFrame},
+    messaging::{DispatchEnvelope, EventEnvelope, SerialisedFrame, NetMessage},
     net::{
         buffers::{BufferChunk, BufferPool, EncodeBuffer},
         network_channel::{ChannelState, TcpChannel},
@@ -12,7 +12,7 @@ use crate::{
         ConnectionState,
         ConnectionState::Connected,
     },
-    prelude::NetMessage,
+    serialisation::ser_helpers::deserialise_chunk_lease,
 };
 use crossbeam_channel::Receiver as Recv;
 use mio::{
@@ -23,7 +23,6 @@ use mio::{
     Token,
 };
 use rustc_hash::FxHashMap;
-use serialisation::ser_helpers::deserialise_chunk_lease;
 use std::{
     collections::VecDeque,
     io,

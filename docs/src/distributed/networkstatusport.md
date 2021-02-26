@@ -7,9 +7,9 @@ Network, or make requests to the Network Layer.
 
 To subscribe to the import a component must implement `Require` for `NetworkStatusPort`. The system must be set-up with 
 a `NetworkingConfig` to enable Networking. When the component is instantiated it must be explicitly connected to the 
-`NetworkStatusPort`. `KompactSystem` exposes the convenience method 
-`connect_network_status_port<C>(&self, component: &Arc<Component<C>>)` to subscribe a component to the port, and may be 
-used as in the example below.
+`NetworkStatusPort`. `KompactSystem` exposes the convenience method
+`connect_network_status_port<C>(&self, required: &mut RequiredPort<NetworkStatusPort>)` to subscribe a component to the
+port, and may be used as in the example below.
 
 ```
 # use kompact::prelude::*;
@@ -20,8 +20,10 @@ cfg.system_components(DeadletterBox::new, {
     net_config.build()
 });
 let system = cfg.build().expect("KompactSystem");
-let c = system.create(NetworkStatusCounter::new);
-system.connect_network_status_port(&c);
+let status_counter = system.create(NetworkStatusCounter::new);
+status_counter.on_definition(|c|{
+  system.connect_network_status_port(&mut c.network_status_port);
+})
 ```
 
 ## Network Status Indications

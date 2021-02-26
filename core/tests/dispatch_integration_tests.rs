@@ -1116,9 +1116,8 @@ fn network_status_port_established_lost_dropped_connection() {
         local_system.create_and_register(move || PingerAct::new_lazy(pinger_path));
     local_system.start(&failing_pinger2);
 
-    // let failure and drop happen
-    thread::sleep(Duration::from_millis(12000));
-    // Assert connection lost and dropped
+    thread::sleep(Duration::from_millis(12000)); // let failure and drop happen
+                                                           // Assert connection lost and dropped
     status_counter.on_definition(|sc| {
         assert_eq!(sc.connection_established, 1);
         assert_eq!(sc.connection_lost, 1);

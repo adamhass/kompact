@@ -506,7 +506,7 @@ impl NetworkDispatcher {
     ) -> Result<(), NetworkBridgeErr> {
         use self::ConnectionState::*;
         match state {
-            ConnectionState::Connected => {
+            Connected => {
                 info!(
                     self.ctx().log(),
                     "registering newly connected conn at {:?}", addr
@@ -918,11 +918,8 @@ impl Dispatcher for NetworkDispatcher {
         }
     }
 
-    fn connect_network_status_port(
-        &mut self,
-        required: &mut RequiredPort<NetworkStatusPort>,
-    ) -> () {
-        utils::biconnect_ports(&mut self.network_status_port, required);
+    fn network_status_port(&mut self) -> &mut ProvidedPort<NetworkStatusPort> {
+        &mut self.network_status_port
     }
 }
 
@@ -1245,7 +1242,7 @@ mod tests {
 
         // We give the connection plenty of time to re-establish and transfer it's old queue and cleanup the BufferChunk
         // TODO no sleeps!
-        thread::sleep(Duration::from_millis(15000));
+        thread::sleep(Duration::from_millis(10000));
 
         // Assertion 2: The Network_Dispatcher on system1 now has 0 buffers to cleanup.
         if let Some(cc) = sc.downcast::<CustomComponents<DeadletterBox, NetworkDispatcher>>() {

@@ -1636,7 +1636,7 @@ impl InternalComponents {
     }
 
     fn connect_network_status_port(&self, required: &mut RequiredPort<NetworkStatusPort>) -> () {
-        self.system_components.connect_network_status_port(required);
+        self.system_components.connect_network_status_port(required)
     }
 
     fn system_path(&self) -> SystemPath {
