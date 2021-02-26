@@ -74,23 +74,20 @@ impl DecodeBuffer {
 
     /// True if there is sufficient amount of writeable bytes
     pub(crate) fn is_writeable(&mut self) -> bool {
-        // TODO: Define what is a sensible amount of minimum bytes to be read at any given moment.
-        if self.writeable_len() > 8 {
-            true
-        } else {
-            false
-        }
+        self.writeable_len() > 8
     }
 
     /// Returns true if there is data to be decoded, else false
-    pub(crate) fn can_decode(&mut self) -> bool {
-        self.decode_frame_head();
+    pub(crate) fn has_frame(&mut self) -> io::Result<bool> {
+        if self.decode_frame_head().is_err() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "framing error"));
+        }
         if let Some(head) = &self.next_frame_head {
             if self.readable_len() >= head.content_length() {
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     /// Swaps the underlying buffer in place with other
@@ -166,7 +163,7 @@ impl DecodeBuffer {
 
     /// Tries to decode one frame from the readable part of the buffer
     pub fn get_frame(&mut self) -> Result<Frame, FramingError> {
-        self.decode_frame_head();
+        self.decode_frame_head()?;
         if let Some(head) = &self.next_frame_head {
             if self.readable_len() >= head.content_length() {
                 let head = self.next_frame_head.take().unwrap();
@@ -188,7 +185,7 @@ impl DecodeBuffer {
                     FrameType::Bye => Ok(Frame::Bye()),
                     FrameType::Ack => Ok(Frame::Ack()),
                     _ => Err(FramingError::UnsupportedFrameType),
-                }
+                };
             }
         }
         Err(FramingError::NoData)

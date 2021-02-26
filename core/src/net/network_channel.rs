@@ -38,20 +38,6 @@ pub(crate) enum ChannelState {
     Closed(SocketAddr, Uuid),
 }
 
-impl ChannelState {
-    fn get_address(&self) -> Option<SocketAddr> {
-        match self {
-            ChannelState::Requested(address, _) => Some(address.clone()),
-            ChannelState::Initialising => None,
-            ChannelState::Initialised(address, _) => Some(address.clone()),
-            ChannelState::Connected(address, _) => Some(address.clone()),
-            ChannelState::CloseRequested(address, _) => Some(address.clone()),
-            ChannelState::CloseReceived(address, _) => Some(address.clone()),
-            ChannelState::Closed(address, _) => Some(address.clone()),
-        }
-    }
-}
-
 pub(crate) struct TcpChannel {
     stream: TcpStream,
     outbound_queue: VecDeque<SerialisedFrame>,
@@ -195,16 +181,16 @@ impl TcpChannel {
     /// Performs receive and decode, should be called repeatedly
     /// May return `Ok(Frame::Data)`, `Ok(Frame::Start)`, `Ok(Frame::Bye)`, or an Error.
     pub fn read_frame(&mut self, buffer_pool: &mut BufferPool) -> io::Result<Option<Frame>> {
-        if !self.input_buffer.can_decode() {
+        if !self.input_buffer.has_frame()? {
             match self.receive() {
-                Ok(n) => {}
+                Ok(_) => {}
                 Err(err) if no_buffer_space(&err) => {
                     // Only swap if everything in the current buffer has been decoded
-                    if !&self.input_buffer.can_decode() {
+                    if !&self.input_buffer.has_frame()? {
                         let mut buffer_chunk = buffer_pool.get_buffer().ok_or(err)?;
                         self.swap_buffer(&mut buffer_chunk);
                         buffer_pool.return_buffer(buffer_chunk);
-                        return self.read_frame(buffer_pool)
+                        return self.read_frame(buffer_pool);
                     }
                 }
                 Err(err) => {
@@ -230,36 +216,27 @@ impl TcpChannel {
             }
             Ok(frame) => Ok(Some(frame)),
             Err(FramingError::NoData) => Ok(None),
-            Err(e) => Err(Error::new(ErrorKind::InvalidData, "Framing Error")),
+            Err(_) => Err(Error::new(ErrorKind::InvalidData, "Framing Error")),
         }
     }
 
     /// This tries to read from the Tcp buffer into the DecodeBuffer, nothing else.
-    fn receive(&mut self) -> io::Result<usize> {
-        let mut read_bytes = 0;
-        let mut sum_read_bytes = 0;
+    fn receive(&mut self) -> io::Result<()> {
         let mut interrupts = 0;
         loop {
-            // Keep all the read bytes in the buffer without overwriting
-            if read_bytes > 0 {
-                self.input_buffer.advance_writeable(read_bytes);
-                read_bytes = 0;
-            }
             let mut buf = self
                 .input_buffer
                 .get_writeable()
-                .ok_or(Error::new(ErrorKind::InvalidInput, "No Buffer Space"))?;
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "No Buffer Space"))?;
             match self.stream.read(&mut buf) {
                 Ok(0) => {
-                    return Ok(sum_read_bytes);
+                    return Ok(());
                 }
                 Ok(n) => {
-                    sum_read_bytes += n;
-                    read_bytes = n;
-                    // continue looping and reading
+                    self.input_buffer.advance_writeable(n);
                 }
                 Err(err) if would_block(&err) => {
-                    return Ok(sum_read_bytes);
+                    return Ok(());
                 }
                 Err(err) if interrupted(&err) => {
                     // We should continue trying until no interruption
@@ -297,19 +274,16 @@ impl TcpChannel {
     }
 
     /// Handles a Bye message. If the method returns Ok it is safe to shutdown.
-    pub fn handle_bye(&mut self) -> io::Result<()> {
+    pub fn handle_bye(&mut self) -> () {
         match self.state {
             ChannelState::Connected(addr, id) => {
                 self.state = ChannelState::CloseReceived(addr, id);
-                self.send_bye()?;
-                // Bye has been sent and received, channel is now closed
-                self.state = ChannelState::Closed(addr, id);
-                Ok(())
+                if self.send_bye().is_ok() {
+                    self.state = ChannelState::Closed(addr, id);
+                }
             }
-            _ => {
-                // Any other state means we just shut it down.
-                io::Result::Ok(())
-            }
+            ChannelState::CloseRequested(addr, id) => self.state = ChannelState::Closed(addr, id),
+            _ => {}
         }
     }
 
@@ -330,11 +304,8 @@ impl TcpChannel {
     /// `true` means that it can safely be dropped.
     pub fn shutdown(&mut self) -> () {
         let _ = self.stream.shutdown(Both); // Discard errors while closing channels for now...
-        match self.state {
-            ChannelState::Connected(addr, id) => {
-                self.state = ChannelState::Closed(addr, id);
-            }
-            _ => (),
+        if let ChannelState::Connected(addr, id) = self.state {
+            self.state = ChannelState::Closed(addr, id);
         }
     }
 

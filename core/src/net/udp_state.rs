@@ -1,13 +1,11 @@
 use super::*;
 use crate::{
     messaging::{NetMessage, SerialisedFrame},
-    net::buffers::{BufferChunk, DecodeBuffer},
+    net::buffers::{BufferChunk, BufferPool, DecodeBuffer},
 };
 use mio::net::UdpSocket;
 use network_thread::*;
-use std::{cmp::min, collections::VecDeque, io, net::SocketAddr};
-use crate::net::buffers::BufferPool;
-use std::io::Error;
+use std::{cmp::min, collections::VecDeque, io, io::Error, net::SocketAddr};
 
 // Note that this is a theoretical IPv4 limit.
 // This may be violated with IPv6 jumbograms.
