@@ -150,7 +150,6 @@ pub trait Actor {
 pub trait Dispatcher: ActorRaw<Message = DispatchEnvelope> {
     /// Returns the system path for this dispatcher
     fn system_path(&mut self) -> SystemPath;
-
     /// Returns a mutable pointer to the dispatchers provided NetworkStatusPort
     /// Can be unimplemented in systems where the NetworkStatusPort is not used
     fn network_status_port(&mut self) -> &mut ProvidedPort<NetworkStatusPort>;
