@@ -407,6 +407,7 @@ pub(crate) fn out_of_buffers(err: &SerError) -> bool {
 pub mod net_test_helpers {
     use crate::prelude::*;
     use std::{
+        cmp::Ordering,
         collections::VecDeque,
         fmt::{Debug, Formatter},
         time::{SystemTime, UNIX_EPOCH},
@@ -569,6 +570,7 @@ pub mod net_test_helpers {
         /// The number of `PongMsg` received
         pub count: u64,
         eager: bool,
+        promise: Option<KPromise<()>>,
     }
 
     impl PingerAct {
@@ -580,6 +582,7 @@ pub mod net_test_helpers {
                 target,
                 count: 0,
                 eager: false,
+                promise: None,
             }
         }
 
@@ -591,7 +594,16 @@ pub mod net_test_helpers {
                 target,
                 count: 0,
                 eager: true,
+                promise: None,
             }
+        }
+
+        /// Creates a future which will be completed by the Pinger when it has received pongs for
+        /// all the pings it sent
+        pub fn make_future(&mut self) -> KFuture<()> {
+            let (promise, future) = promise();
+            self.promise = Some(promise);
+            future
         }
     }
 
@@ -621,14 +633,24 @@ pub mod net_test_helpers {
                 Ok(pong) => {
                     debug!(self.ctx.log(), "Got msg {:?}", pong);
                     self.count += 1;
-                    if self.count < PING_COUNT {
-                        if self.eager {
+                    match self.count.cmp(&PING_COUNT) {
+                        Ordering::Less if self.eager => {
                             self.target
                                 .tell_serialised(PingMsg { i: pong.i + 1 }, self)
                                 .expect("serialise");
-                        } else {
+                        }
+                        Ordering::Less => {
                             self.target.tell(PingMsg { i: pong.i + 1 }, self);
                         }
+                        Ordering::Equal if self.promise.is_some() => {
+                            let _ = self
+                                .promise
+                                .take()
+                                .expect("Failed to fulfil promise")
+                                .fulfil(())
+                                .expect("Failed to fulfil promise");
+                        }
+                        _ => {}
                     }
                 }
                 Err(e) => error!(self.ctx.log(), "Error deserialising PongMsg: {:?}", e),
@@ -956,6 +978,7 @@ pub mod net_test_helpers {
         eager: bool,
         buffer_config: BufferConfig,
         pre_serialised: Option<VecDeque<ChunkRef>>,
+        promise: Option<KPromise<()>>,
     }
 
     #[allow(dead_code)]
@@ -974,6 +997,7 @@ pub mod net_test_helpers {
                 eager: false,
                 buffer_config: BufferConfig::default(),
                 pre_serialised: None,
+                promise: None,
             }
         }
 
@@ -992,6 +1016,7 @@ pub mod net_test_helpers {
                 eager: true,
                 buffer_config,
                 pre_serialised: None,
+                promise: None,
             }
         }
 
@@ -1011,7 +1036,16 @@ pub mod net_test_helpers {
                 eager: true,
                 buffer_config,
                 pre_serialised: Some(pre_serialised),
+                promise: None,
             }
+        }
+
+        /// Creates a future which will be completed by the Pinger when it has received pongs for
+        /// all the pings it sent
+        pub fn make_future(&mut self) -> KFuture<()> {
+            let (promise, future) = promise();
+            self.promise = Some(promise);
+            future
         }
     }
 
@@ -1078,6 +1112,8 @@ pub mod net_test_helpers {
                             let ping = BigPingMsg::new(pong.i + 1, self.data_size);
                             self.target.tell(ping, self);
                         }
+                    } else if let Some(promise) = self.promise.take() {
+                        let _ = promise.fulfil(());
                     }
                 }
                 Err(e) => error!(self.ctx.log(), "Error deserialising BigPongMsg: {:?}", e),

@@ -581,7 +581,6 @@ impl NetworkThread {
             ChannelState::Closed(_, _) => {
                 trace!(self.log, "Connection shutdown gracefully");
                 self.notify_connection_state(channel.address(), ConnectionState::Closed);
-                self.drop_channel(channel);
             }
             ChannelState::CloseReceived(_, _) => {}
             _ => {
@@ -594,7 +593,7 @@ impl NetworkThread {
         if let Some(channel_rc) = self.get_channel_by_address(&address) {
             let mut channel = channel_rc.borrow_mut();
             if let ChannelState::Connected(_, _) = channel.state {
-                error!(self.log, "ClosedAck for connected Channel: {:#?}", &channel);
+                warn!(self.log, "ClosedAck for connected Channel: {:#?}", &channel);
             } else {
                 self.drop_channel(&mut channel)
             }
